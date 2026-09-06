@@ -1,60 +1,78 @@
+//! quiche QUIC configuration for the hysteria2 client, built on BoringSSL.
+//!
+//! quiche links the same vendored BoringSSL as `meow-transport` (via the
+//! `boring` crate), so this reuses `boring::ssl::SslContextBuilder` for the
+//! server-certificate trust decision — a SHA-256 leaf pin, `insecure` (no
+//! verification), or normal chain and hostname validation against the Mozilla
+//! CA bundle — and hands the builder to quiche.
+
 use super::{Config, Error, Result};
-use quinn::{ClientConfig, TransportConfig, VarInt};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
+use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+use boring::x509::X509StoreContextRef;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::time::Duration;
 
 const ALPN_H3: &[u8] = b"h3";
-const DEFAULT_STREAM_RECEIVE_WINDOW: u32 = 8_388_608;
-const DEFAULT_CONN_RECEIVE_WINDOW: u32 = DEFAULT_STREAM_RECEIVE_WINDOW * 5 / 2;
-const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(10);
-const DATAGRAM_BUFFER_SIZE: usize = 1024 * 1024;
+const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+const CONN_RECEIVE_WINDOW: u64 = STREAM_RECEIVE_WINDOW * 5 / 2;
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_STREAMS: u64 = 1024;
+const DGRAM_QUEUE_LEN: usize = 1024;
 
-pub fn build_client_config(config: &Config) -> Result<ClientConfig> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+/// Build a client `quiche::Config` for the given hysteria2 config.
+pub fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
+    let mut ssl = SslContextBuilder::new(SslMethod::tls())
+        .map_err(|e| Error::tls(format!("boring SslContextBuilder: {e}")))?;
+
     let pin = parse_sha256_pin(&config.pin_sha256)?;
+    match server_cert_verifier(config.insecure, pin) {
+        CertVerifier::Pin(expected) => {
+            ssl.set_verify_callback(SslVerifyMode::PEER, move |_preverify_ok, ctx| {
+                leaf_matches_pin(ctx, &expected)
+            });
+        }
+        CertVerifier::Insecure => ssl.set_verify(SslVerifyMode::NONE),
+        CertVerifier::WebPki => {
+            seed_roots(&mut ssl)?;
+            ssl.set_verify(SslVerifyMode::PEER);
+        }
+    }
 
-    let builder = rustls::ClientConfig::builder();
-    let mut tls_config = match server_cert_verifier(config.insecure, pin) {
-        Some(verifier) => builder
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth(),
-        None => builder
-            .with_root_certificates(root_store())
-            .with_no_client_auth(),
-    };
+    // quiche installs the SNI as the verify-param hostname per connection and
+    // only touches the verify mode through `verify_peer`, which the client
+    // never calls, so the choice above is what BoringSSL enforces.
+    let mut quic = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ssl)
+        .map_err(|e| Error::tls(format!("quiche config: {e}")))?;
 
-    tls_config.alpn_protocols = vec![ALPN_H3.to_vec()];
+    quic.set_application_protos(&[ALPN_H3])
+        .map_err(|e| Error::tls(format!("quiche alpn: {e}")))?;
+    quic.set_max_idle_timeout(u64::try_from(MAX_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
+    quic.set_initial_max_data(CONN_RECEIVE_WINDOW);
+    quic.set_initial_max_stream_data_bidi_local(STREAM_RECEIVE_WINDOW);
+    quic.set_initial_max_stream_data_bidi_remote(STREAM_RECEIVE_WINDOW);
+    quic.set_initial_max_stream_data_uni(STREAM_RECEIVE_WINDOW);
+    quic.set_initial_max_streams_bidi(MAX_CONCURRENT_STREAMS);
+    quic.set_initial_max_streams_uni(MAX_CONCURRENT_STREAMS);
+    // hysteria2 disables the QUIC bit greasing.
+    quic.grease(false);
+    // UDP relay rides QUIC datagrams.
+    quic.enable_dgram(true, DGRAM_QUEUE_LEN, DGRAM_QUEUE_LEN);
 
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_config))
-        .map_err(|e| Error::tls(format!("quinn rustls setup: {e}")))?;
-    let mut client = ClientConfig::new(Arc::new(crypto));
-
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(DEFAULT_KEEP_ALIVE));
-    transport.max_idle_timeout(Some(
-        DEFAULT_MAX_IDLE_TIMEOUT
-            .try_into()
-            .map_err(|e| Error::tls(format!("quic idle timeout setup: {e}")))?,
-    ));
-    transport.stream_receive_window(VarInt::from_u32(DEFAULT_STREAM_RECEIVE_WINDOW));
-    transport.receive_window(VarInt::from_u32(DEFAULT_CONN_RECEIVE_WINDOW));
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(1024));
-    transport.max_concurrent_uni_streams(VarInt::from_u32(1024));
-    transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_SIZE));
-    transport.datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE);
-    client.transport_config(Arc::new(transport));
-
-    Ok(client)
+    Ok(quic)
 }
 
-/// Pick the certificate verifier for a client config. `None` means "no custom
-/// verifier" — validate against the bundled WebPKI roots as usual.
+/// How the server certificate is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertVerifier {
+    /// Trust exactly the certificate whose DER SHA-256 digest matches.
+    Pin([u8; 32]),
+    /// `skip-cert-verify` without a pin: accept anything.
+    Insecure,
+    /// Chain and hostname validation against the bundled Mozilla roots.
+    WebPki,
+}
+
+/// Pick the certificate verifier for a client config.
 ///
 /// A configured fingerprint remains mandatory even when `insecure` is set.
 ///
@@ -62,21 +80,55 @@ pub fn build_client_config(config: &Config) -> Result<ClientConfig> {
 /// mihomo's leaf-fingerprint path and allowing self-signed certificates.
 /// Hysteria's CLI differs: its pin is an additional leaf check, while its
 /// `insecure` setting independently controls chain and hostname validation.
-fn server_cert_verifier(
-    insecure: bool,
-    pin: Option<[u8; 32]>,
-) -> Option<Arc<dyn ServerCertVerifier>> {
+fn server_cert_verifier(insecure: bool, pin: Option<[u8; 32]>) -> CertVerifier {
     match (pin, insecure) {
-        (Some(expected), _) => Some(Arc::new(PinVerifier::new(expected))),
-        (None, true) => Some(Arc::new(NoVerify)),
-        (None, false) => None,
+        (Some(expected), _) => CertVerifier::Pin(expected),
+        (None, true) => CertVerifier::Insecure,
+        (None, false) => CertVerifier::WebPki,
     }
 }
 
-fn root_store() -> RootCertStore {
-    RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+/// BoringSSL verify callback for a leaf pin (`fingerprint` / `pin-sha256`).
+///
+/// BoringSSL invokes the callback once per chain position and once per
+/// verification error, passing its own verdict as `preverify_ok`. That verdict
+/// is ignored: a pinned self-signed certificate fails chain building, and the
+/// SNI need not match either. Positions above the leaf are accepted so
+/// verification reaches depth 0, where only the end-entity digest decides.
+/// Unrelated certificates appended to the chain therefore cannot satisfy the
+/// pin. Possession of the private key is still proven: BoringSSL checks the
+/// `CertificateVerify` signature independently of this callback.
+fn leaf_matches_pin(ctx: &mut X509StoreContextRef, expected: &[u8; 32]) -> bool {
+    if ctx.error_depth() != 0 {
+        return true;
     }
+    let leaf = ctx
+        .chain()
+        .and_then(|chain| chain.get(0))
+        .or_else(|| ctx.current_cert());
+    let Some(leaf) = leaf else {
+        return false;
+    };
+    let Ok(der) = leaf.to_der() else {
+        return false;
+    };
+    Sha256::digest(&der).as_slice() == expected
+}
+
+/// Seed the BoringSSL verify store with the Mozilla CA bundle (mirrors
+/// `meow-transport`'s BoringSSL backend). The default store is empty.
+fn seed_roots(ssl: &mut SslContextBuilder) -> Result<()> {
+    let mut store = boring::x509::store::X509StoreBuilder::new()
+        .map_err(|e| Error::tls(format!("X509StoreBuilder: {e}")))?;
+    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        let x509 = boring::x509::X509::from_der(cert.as_ref())
+            .map_err(|e| Error::tls(format!("root cert parse: {e}")))?;
+        store
+            .add_cert(x509)
+            .map_err(|e| Error::tls(format!("root store add_cert: {e}")))?;
+    }
+    ssl.set_cert_store_builder(store);
+    Ok(())
 }
 
 fn parse_sha256_pin(raw: &str) -> Result<Option<[u8; 32]>> {
@@ -84,7 +136,6 @@ fn parse_sha256_pin(raw: &str) -> Result<Option<[u8; 32]>> {
     if raw.is_empty() {
         return Ok(None);
     }
-
     let without_prefix = raw
         .strip_prefix("sha256=")
         .or_else(|| raw.strip_prefix("SHA256="))
@@ -99,7 +150,6 @@ fn parse_sha256_pin(raw: &str) -> Result<Option<[u8; 32]>> {
             "pin-sha256/fingerprint must be a SHA-256 hex digest",
         ));
     }
-
     let decoded = hex::decode(normalized)
         .map_err(|e| Error::config(format!("invalid SHA-256 fingerprint: {e}")))?;
     let mut pin = [0u8; 32];
@@ -107,132 +157,12 @@ fn parse_sha256_pin(raw: &str) -> Result<Option<[u8; 32]>> {
     Ok(Some(pin))
 }
 
-#[derive(Debug)]
-struct NoVerify;
-
-impl ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        all_schemes()
-    }
-}
-
-/// Trust exactly one certificate, identified by the SHA-256 digest of its DER
-/// encoding (`fingerprint` / `pin-sha256`).
-///
-/// Only the end-entity certificate is compared. This is a leaf-certificate
-/// pin, not a trust-anchor pin: unrelated appended certificates cannot satisfy
-/// it. Hysteria also compares the leaf; mihomo additionally supports a pinned
-/// CA by verifying the leaf's chain against that anchor.
-#[derive(Debug)]
-struct PinVerifier {
-    expected: [u8; 32],
-    /// rustls exposes handshake-signature verification through this same
-    /// verifier trait. The certificate digest alone does not prove possession
-    /// of the private key: certificates are public and can be replayed.
-    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
-}
-
-impl PinVerifier {
-    fn new(expected: [u8; 32]) -> Self {
-        Self {
-            expected,
-            supported_algs: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms,
-        }
-    }
-}
-
-impl ServerCertVerifier for PinVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        let actual = Sha256::digest(end_entity.as_ref());
-        if actual.as_slice() == self.expected {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(
-                "server certificate SHA-256 fingerprint mismatch".into(),
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.supported_algs.supported_schemes()
-    }
-}
-
-fn all_schemes() -> Vec<SignatureScheme> {
-    use rustls::SignatureScheme::*;
-    vec![
-        RSA_PKCS1_SHA256,
-        ECDSA_NISTP256_SHA256,
-        RSA_PKCS1_SHA384,
-        ECDSA_NISTP384_SHA384,
-        RSA_PKCS1_SHA512,
-        ECDSA_NISTP521_SHA512,
-        RSA_PSS_SHA256,
-        RSA_PSS_SHA384,
-        RSA_PSS_SHA512,
-        ED25519,
-        ED448,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boring::pkey::{PKey, Private};
+    use boring::x509::X509;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn parses_sha256_pin_variants() {
@@ -250,57 +180,13 @@ mod tests {
         assert!(parse_sha256_pin("abc").is_err());
     }
 
-    /// A self-signed certificate and its `fingerprint`, as a hysteria2 server
-    /// set up by the upstream install script would present.
-    struct SelfSigned {
-        cert: CertificateDer<'static>,
-        key: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
-        pin: [u8; 32],
-    }
-
-    fn self_signed() -> SelfSigned {
-        let ck = rcgen::generate_simple_self_signed(vec!["hy2.example".into()]).unwrap();
-        let cert = CertificateDer::from(ck.cert.der().to_vec());
-        let mut pin = [0u8; 32];
-        pin.copy_from_slice(Sha256::digest(cert.as_ref()).as_slice());
-        SelfSigned {
-            cert,
-            key: rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der()),
-            pin,
-        }
-    }
-
-    fn verify(
-        verifier: &dyn ServerCertVerifier,
-        cert: &CertificateDer<'_>,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        verifier.verify_server_cert(
-            cert,
-            &[],
-            &ServerName::try_from("hy2.example").unwrap(),
-            &[],
-            UnixTime::now(),
-        )
-    }
-
-    /// The point of pinning: a server certificate that chains to nothing is
-    /// trusted because its digest matches. The previous verifier ran WebPKI
-    /// chain validation first, so every self-signed hysteria2 server — the
-    /// overwhelmingly common deployment — failed the handshake even with a
-    /// correct `fingerprint`.
     #[test]
-    fn a_matching_pin_trusts_a_self_signed_cert() {
-        let server = self_signed();
-        let verifier =
-            server_cert_verifier(false, Some(server.pin)).expect("pin needs a custom verifier");
-        verify(verifier.as_ref(), &server.cert).expect("pinned cert must verify");
-    }
-
-    #[test]
-    fn a_mismatched_pin_is_rejected() {
-        let server = self_signed();
-        let verifier = server_cert_verifier(false, Some([0x11; 32])).unwrap();
-        assert!(verify(verifier.as_ref(), &server.cert).is_err());
+    fn builds_config_for_insecure() {
+        let cfg = Config {
+            insecure: true,
+            ..Config::default()
+        };
+        assert!(build_quiche_config(&cfg).is_ok());
     }
 
     /// `skip-cert-verify: true` alongside a `fingerprint` used to win, quietly
@@ -308,264 +194,251 @@ mod tests {
     /// setting must survive (mihomo applies the pin last, for the same reason).
     #[test]
     fn a_pin_overrides_skip_cert_verify() {
-        let server = self_signed();
-        let verifier = server_cert_verifier(true, Some(server.pin)).unwrap();
-        verify(verifier.as_ref(), &server.cert).expect("the pinned cert still verifies");
-
-        let other = server_cert_verifier(true, Some([0x22; 32])).unwrap();
-        assert!(
-            verify(other.as_ref(), &server.cert).is_err(),
-            "skip-cert-verify must not disable a configured pin"
+        assert_eq!(
+            server_cert_verifier(true, Some([0x22; 32])),
+            CertVerifier::Pin([0x22; 32])
+        );
+        assert_eq!(
+            server_cert_verifier(false, Some([0x22; 32])),
+            CertVerifier::Pin([0x22; 32])
         );
     }
 
     #[test]
     fn skip_cert_verify_without_a_pin_accepts_anything() {
-        let server = self_signed();
-        let verifier = server_cert_verifier(true, None).unwrap();
-        verify(verifier.as_ref(), &server.cert).expect("insecure accepts any cert");
+        assert_eq!(server_cert_verifier(true, None), CertVerifier::Insecure);
     }
 
     #[test]
     fn plain_config_keeps_the_webpki_roots() {
-        assert!(
-            server_cert_verifier(false, None).is_none(),
-            "no pin and no skip-cert-verify must fall through to the root store"
-        );
+        assert_eq!(server_cert_verifier(false, None), CertVerifier::WebPki);
     }
 
-    /// Drive a real TLS 1.3 handshake against a local server presenting
-    /// `server`'s certificate, with `verifier` on the client side. Returns the
-    /// client's handshake result — the whole rustls path (certificate *and*
+    /// A self-signed certificate and its `fingerprint`, as a hysteria2 server
+    /// set up by the upstream install script would present.
+    struct SelfSigned {
+        cert: X509,
+        key: PKey<Private>,
+        pin: String,
+    }
+
+    fn self_signed(name: &str) -> SelfSigned {
+        let ck = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        SelfSigned {
+            cert: X509::from_der(ck.cert.der()).unwrap(),
+            key: PKey::private_key_from_der(&ck.key_pair.serialize_der()).unwrap(),
+            pin: hex::encode(Sha256::digest(ck.cert.der())),
+        }
+    }
+
+    /// Server TLS context presenting `leaf`, optionally with an unrelated
+    /// certificate appended to the chain.
+    fn server_ssl(leaf: &SelfSigned, appended: Option<&SelfSigned>) -> SslContextBuilder {
+        let mut ssl = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        ssl.set_certificate(&leaf.cert).unwrap();
+        ssl.set_private_key(&leaf.key).unwrap();
+        if let Some(extra) = appended {
+            ssl.add_extra_chain_cert(extra.cert.clone()).unwrap();
+        }
+        ssl
+    }
+
+    fn client_config(server_name: &str, insecure: bool, pin: &str) -> Config {
+        Config {
+            server_name: server_name.into(),
+            insecure,
+            pin_sha256: pin.into(),
+            ..Config::default()
+        }
+    }
+
+    async fn flush(
+        conn: &mut quiche::Connection,
+        socket: &UdpSocket,
+    ) -> std::result::Result<(), String> {
+        let mut out = [0u8; 1500];
+        loop {
+            match conn.send(&mut out) {
+                Ok((n, info)) => {
+                    socket
+                        .send_to(&out[..n], info.to)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Err(quiche::Error::Done) => return Ok(()),
+                Err(e) => return Err(format!("send: {e}")),
+            }
+        }
+    }
+
+    /// Drive a real QUIC handshake between the production client config and a
+    /// local quiche server presenting `server_ssl`'s certificate. Returns the
+    /// client's verdict: the whole BoringSSL path (certificate *and*
     /// `CertificateVerify` signature), not just the digest comparison.
     async fn handshake(
-        verifier: Arc<dyn ServerCertVerifier>,
-        server: &SelfSigned,
+        client_cfg: &Config,
+        server_ssl: SslContextBuilder,
     ) -> std::result::Result<(), String> {
-        // Both provider features are reachable through the dev-dependency
-        // graph, so the process default has to be chosen explicitly — same
-        // call `build_client_config` makes.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![server.cert.clone()],
-                rustls::pki_types::PrivateKeyDer::Pkcs8(server.key.clone_key()),
-            )
-            .map_err(|e| format!("server config: {e}"))?;
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                let _ = acceptor.accept(stream).await;
-            }
-        });
-
-        let client_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        connector
-            .connect(ServerName::try_from("hy2.example").unwrap(), stream)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    /// End-to-end shape of the bug: a self-signed server plus the matching
-    /// `fingerprint` must complete a handshake, and a wrong fingerprint must
-    /// abort it.
-    #[tokio::test]
-    async fn a_pinned_self_signed_server_completes_a_handshake() {
-        let server = self_signed();
-
-        handshake(
-            server_cert_verifier(false, Some(server.pin)).unwrap(),
-            &server,
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            handshake_inner(client_cfg, server_ssl),
         )
         .await
-        .expect("a correctly pinned self-signed server must be reachable");
+        .map_err(|_| "local QUIC handshake must finish".to_string())?
+    }
 
-        let wrong = handshake(
-            server_cert_verifier(false, Some([0x33; 32])).unwrap(),
-            &server,
+    async fn handshake_inner(
+        client_cfg: &Config,
+        server_ssl: SslContextBuilder,
+    ) -> std::result::Result<(), String> {
+        let mut server_config =
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, server_ssl)
+                .map_err(|e| e.to_string())?;
+        server_config.set_application_protos(&[ALPN_H3]).unwrap();
+        server_config.set_max_idle_timeout(5_000);
+        server_config.set_initial_max_data(1 << 20);
+        server_config.set_initial_max_streams_bidi(16);
+        server_config.set_initial_max_streams_uni(16);
+        server_config.set_initial_max_stream_data_bidi_remote(64 * 1024);
+        server_config.set_initial_max_stream_data_uni(64 * 1024);
+
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let mut client_config = build_quiche_config(client_cfg).map_err(|e| e.to_string())?;
+        let scid = quiche::ConnectionId::from_ref(&[7u8; quiche::MAX_CONN_ID_LEN]);
+        let mut client = quiche::connect(
+            Some(&client_cfg.server_name),
+            &scid,
+            client_addr,
+            server_addr,
+            &mut client_config,
         )
-        .await;
-        assert!(wrong.is_err(), "a wrong pin must abort the handshake");
-    }
+        .map_err(|e| e.to_string())?;
+        let mut server: Option<quiche::Connection> = None;
+        let mut sbuf = [0u8; 65535];
+        let mut cbuf = [0u8; 65535];
 
-    /// Records the `CertificateVerify` inputs rustls passes to the wrapped
-    /// verifier during a real handshake.
-    #[derive(Debug)]
-    struct CaptureSignature {
-        inner: Arc<dyn ServerCertVerifier>,
-        seen: std::sync::Mutex<Vec<(Vec<u8>, CertificateDer<'static>, DigitallySignedStruct)>>,
-    }
-
-    impl ServerCertVerifier for CaptureSignature {
-        fn verify_server_cert(
-            &self,
-            end_entity: &CertificateDer<'_>,
-            intermediates: &[CertificateDer<'_>],
-            server_name: &ServerName<'_>,
-            ocsp_response: &[u8],
-            now: UnixTime,
-        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            self.inner.verify_server_cert(
-                end_entity,
-                intermediates,
-                server_name,
-                ocsp_response,
-                now,
-            )
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            self.inner.verify_tls12_signature(message, cert, dss)
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            self.seen.lock().unwrap().push((
-                message.to_vec(),
-                cert.clone().into_owned(),
-                dss.clone(),
-            ));
-            self.inner.verify_tls13_signature(message, cert, dss)
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.inner.supported_verify_schemes()
+        loop {
+            flush(&mut client, &client_sock).await?;
+            if let Some(conn) = server.as_mut() {
+                flush(conn, &server_sock).await?;
+            }
+            if client.is_established() {
+                return Ok(());
+            }
+            if client.is_closed() || client.local_error().is_some() || client.peer_error().is_some()
+            {
+                return Err(format!(
+                    "client closed: local={:?} peer={:?}",
+                    client.local_error(),
+                    client.peer_error()
+                ));
+            }
+            let wait = client
+                .timeout()
+                .into_iter()
+                .chain(server.as_ref().and_then(quiche::Connection::timeout))
+                .min()
+                .unwrap_or(Duration::from_millis(100));
+            tokio::select! {
+                r = server_sock.recv_from(&mut sbuf) => {
+                    let (n, from) = r.map_err(|e| e.to_string())?;
+                    if server.is_none() {
+                        let hdr = quiche::Header::from_slice(&mut sbuf[..n], quiche::MAX_CONN_ID_LEN)
+                            .map_err(|e| e.to_string())?;
+                        let conn = quiche::accept(&hdr.dcid, None, server_addr, from, &mut server_config)
+                            .map_err(|e| e.to_string())?;
+                        server = Some(conn);
+                    }
+                    let conn = server.as_mut().unwrap();
+                    let _ = conn.recv(&mut sbuf[..n], quiche::RecvInfo { from, to: server_addr });
+                }
+                r = client_sock.recv_from(&mut cbuf) => {
+                    let (n, from) = r.map_err(|e| e.to_string())?;
+                    // A rejected certificate surfaces here as `TlsFail` and
+                    // sets the client's local error.
+                    let _ = client.recv(&mut cbuf[..n], quiche::RecvInfo { from, to: client_addr });
+                }
+                () = tokio::time::sleep(wait) => {
+                    client.on_timeout();
+                    if let Some(conn) = server.as_mut() {
+                        conn.on_timeout();
+                    }
+                }
+            }
         }
     }
 
-    /// Pinning must not weaken the handshake itself. Certificates are public,
-    /// so if the verifier asserted signatures instead of checking them anyone
-    /// could replay the pinned certificate without holding its private key —
-    /// the pin would authenticate nothing.
-    ///
-    /// Capture the real `CertificateVerify` from a successful handshake, then
-    /// replay it over a tampered transcript: the pin verifier must reject it.
-    #[tokio::test]
-    async fn pinning_still_verifies_the_handshake_signature() {
-        let server = self_signed();
-        let capture = Arc::new(CaptureSignature {
-            inner: server_cert_verifier(false, Some(server.pin)).unwrap(),
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-
-        handshake(Arc::clone(&capture) as Arc<dyn ServerCertVerifier>, &server)
-            .await
-            .expect("pinned handshake succeeds");
-
-        let seen = capture.seen.lock().unwrap();
-        let (message, cert, dss) = seen.first().expect("TLS 1.3 CertificateVerify was checked");
-
-        let verifier = server_cert_verifier(false, Some(server.pin)).unwrap();
-        verifier
-            .verify_tls13_signature(message, cert, dss)
-            .expect("the genuine signature verifies");
-
-        let mut tampered = message.clone();
-        tampered[0] ^= 0xff;
-        assert!(
-            verifier
-                .verify_tls13_signature(&tampered, cert, dss)
-                .is_err(),
-            "a signature that does not cover the transcript must be rejected"
-        );
-    }
-}
-#[cfg(test)]
-mod quic_pin_tests {
-    use super::*;
-
+    /// The point of pinning: a self-signed server plus the matching
+    /// `fingerprint` completes a handshake whatever `skip-cert-verify` says, a
+    /// wrong fingerprint aborts it even with `skip-cert-verify`, and without a
+    /// pin the two insecure settings keep their usual meaning.
     #[tokio::test]
     async fn production_quic_config_pin_matrix() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let ck = rcgen::generate_simple_self_signed(vec!["hy2.example".into()]).unwrap();
-        let cert = CertificateDer::from(ck.cert.der().to_vec());
-        let pin = hex::encode(Sha256::digest(cert.as_ref()));
-        for (insecure, fingerprint, expected) in [
-            (false, pin.clone(), true),
-            (true, pin.clone(), true),
+        let server = self_signed("hy2.example");
+        for (insecure, pin, expected) in [
+            (false, server.pin.clone(), true),
+            (true, server.pin.clone(), true),
             (false, "11".repeat(32), false),
             (true, "11".repeat(32), false),
             (false, String::new(), false),
             (true, String::new(), true),
         ] {
-            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
-            let mut server_tls = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert.clone()], key.into())
-                .unwrap();
-            server_tls.alpn_protocols = vec![b"h3".to_vec()];
-            let server_crypto =
-                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
-            let server = quinn::Endpoint::server(
-                quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
-                "127.0.0.1:0".parse().unwrap(),
+            let result = handshake(
+                &client_config("hy2.example", insecure, &pin),
+                server_ssl(&server, None),
             )
-            .unwrap();
-            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(
-                build_client_config(&Config {
-                    insecure,
-                    pin_sha256: fingerprint.clone(),
-                    ..Default::default()
-                })
-                .unwrap(),
-            );
-            let addr = server.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                let incoming = server.accept().await.unwrap();
-                let result = incoming.await;
-                (server, result)
-            });
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.connect(addr, "hy2.example").unwrap(),
-            )
-            .await
-            .expect("local QUIC handshake must finish");
+            .await;
             assert_eq!(
                 result.is_ok(),
                 expected,
                 "insecure={insecure}, pin={}, result={result:?}",
-                !fingerprint.is_empty()
+                !pin.is_empty()
             );
-            client.close(0u32.into(), b"test complete");
-            task.abort();
-            let _ = task.await;
+            if let Err(e) = &result {
+                assert!(is_tls_alert(e), "expected a TLS alert, got {e}");
+            }
         }
     }
 
-    #[test]
-    fn appending_pinned_certificate_does_not_authenticate_another_leaf() {
-        let pinned = rcgen::generate_simple_self_signed(vec!["hy2.example".into()]).unwrap();
-        let other = rcgen::generate_simple_self_signed(vec!["hy2.example".into()]).unwrap();
-        let hash: [u8; 32] = Sha256::digest(pinned.cert.der().as_ref()).into();
-        let verifier = server_cert_verifier(true, Some(hash)).unwrap();
-        let result = verifier.verify_server_cert(
-            other.cert.der(),
-            &[pinned.cert.der().clone()],
-            &ServerName::try_from("hy2.example").unwrap(),
-            &[],
-            UnixTime::now(),
-        );
-        assert!(result.is_err());
+    /// A refused certificate closes the connection with a CRYPTO_ERROR
+    /// (0x0100 + the TLS alert), not an application or transport error.
+    fn is_tls_alert(err: &str) -> bool {
+        err.split("error_code: ")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|code| code.parse::<u64>().ok())
+            .is_some_and(|code| (0x100..0x200).contains(&code))
+    }
+
+    /// The pin is the trust decision: it also replaces hostname validation,
+    /// as in mihomo's leaf-fingerprint path.
+    #[tokio::test]
+    async fn a_pin_replaces_hostname_validation() {
+        let server = self_signed("hy2.example");
+        handshake(
+            &client_config("other.example", false, &server.pin),
+            server_ssl(&server, None),
+        )
+        .await
+        .expect("a pinned certificate is trusted regardless of the SNI");
+    }
+
+    /// Only the end-entity certificate is compared: an unrelated certificate
+    /// appended to the chain cannot satisfy the pin.
+    #[tokio::test]
+    async fn appending_pinned_certificate_does_not_authenticate_another_leaf() {
+        let pinned = self_signed("hy2.example");
+        let other = self_signed("hy2.example");
+        let result = handshake(
+            &client_config("hy2.example", true, &pinned.pin),
+            server_ssl(&other, Some(&pinned)),
+        )
+        .await;
+        let err = result.expect_err("an unrelated leaf must be rejected");
+        assert!(is_tls_alert(&err), "expected a TLS alert, got {err}");
     }
 }
