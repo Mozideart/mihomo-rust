@@ -461,6 +461,13 @@ cargo test --test shadowsocks_integration
 bash tests/test_tproxy_qemu.sh
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: meow-rs is a client-only
+kernel (no server-side features), new features and config keys should follow
+mihomo mainline, and every PR must pass the full CI test bar and respect the
+ADRs in [`docs/adr/`](docs/adr/).
+
 ## License
 
 MIT — Copyright (c) 2026 Max Lv. See [LICENSE](LICENSE).
