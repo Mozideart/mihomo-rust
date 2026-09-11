@@ -10,7 +10,7 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Bundled rules + domain index + proxies map, swapped as one `Arc` on
 /// config reload. Reads on the connection-setup hot path take a single
@@ -274,23 +274,50 @@ impl TunnelInner {
     ) -> (Arc<dyn ProxyAdapter>, SmolStr, SmolStr) {
         match result {
             Some(m) => {
-                let action = if m.adapter_name == "DIRECT" {
+                let target = m.adapter_name;
+                let mut action = if target == "DIRECT" {
                     "DIRECT"
-                } else if m.adapter_name.starts_with("REJECT") {
+                } else if target.starts_with("REJECT") {
                     "REJECT"
                 } else {
                     "PROXY"
                 };
+                let proxy: Arc<dyn ProxyAdapter> = match route.proxies.get(target).cloned() {
+                    Some(p) => p as Arc<dyn ProxyAdapter>,
+                    // DIRECT needs no registry entry: the tunnel owns a direct
+                    // adapter for exactly this.
+                    None if target == "DIRECT" => Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
+                    None => {
+                        // Deliberate deviation from upstream mihomo: its match
+                        // loop *skips* a rule whose target is absent and keeps
+                        // scanning (`continue`), reaching DIRECT only via the
+                        // no-match tail. meow-rs stops at the first match and
+                        // dials DIRECT — a subscription that dropped one node
+                        // keeps routing the rest, but a later rule upstream
+                        // would have matched is never consulted (issue #513;
+                        // skip-and-continue is tracked as a parity follow-up).
+                        //
+                        // What it must not do is hide the fallback — it was a
+                        // `debug!` and `action` was derived from the name
+                        // alone, so at the default log level nothing said the
+                        // connection left the machine directly, and the
+                        // statistics counted a proxy hop that never happened.
+                        //
+                        // Interpolate into the message itself: the /logs
+                        // broadcast keeps only the `message` field, so
+                        // structured fields would never reach it.
+                        warn!(
+                            "rule {} matched target '{target}' which is not in \
+                             the registry; dialling DIRECT",
+                            m.rule_type.as_str()
+                        );
+                        action = "DIRECT";
+                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
+                    }
+                };
                 self.stats
                     .rule_match
                     .increment(m.rule_type.as_str(), action);
-                let proxy = route.proxies.get(m.adapter_name).cloned().map_or_else(
-                    || {
-                        debug!("proxy '{}' not found, using DIRECT", m.adapter_name);
-                        Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>
-                    },
-                    |p| p as Arc<dyn ProxyAdapter>,
-                );
                 // `rule_type.as_str()` is a `&'static str` — wrap it
                 // inline without heap.
                 (

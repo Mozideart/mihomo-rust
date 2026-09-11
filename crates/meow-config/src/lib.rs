@@ -547,9 +547,17 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// Apply per-outbound `dialer-proxy` in place (issue #210).
 ///
 /// For every proxy that declares `dialer-proxy: <name>`, its registry entry is
-/// re-parsed from the raw config with a [`meow_proxy::dialer::ProxyDialer`]
+/// re-parsed from the raw config with a [`meow_proxy::dialer::NamedProxyDialer`]
 /// injected, so the adapter dials its server through `<name>` transparently
 /// (mihomo `proxyDialer` model).
+///
+/// `<name>` is bound *late*: the injected dialer keeps the name plus a
+/// [`meow_proxy::dialer::ProxyRegistry`] handle and looks the front proxy up on
+/// every dial, which is what mihomo does (`component/proxydialer/byname.go`).
+/// Capturing the front `Arc` here instead freezes whatever the registry holds
+/// at build time — and since this pass runs *before* groups are built, so that
+/// grouped members inherit the chain (issue #513), a group-valued dialer does
+/// not exist yet at that point.
 ///
 /// Adapter types that do not establish their underlying connection through the
 /// pluggable dialer — `anytls`, `hysteria2` (QUIC), and `ss` with an external
@@ -564,23 +572,26 @@ pub fn rebuild_from_raw_with_cache_dir(
 /// association rather than leaking the real source path; mux-based UDP rides
 /// the dialer over TCP and is unaffected.
 ///
-/// Nested dialer-proxies are resolved deepest-first so each layer sees its
-/// dialer's final (already-rebuilt) form. A self-referencing dialer, a
-/// reference to an unknown proxy, or a dialer cycle is a hard config error —
-/// silently falling back to a direct dial would let traffic egress from the
-/// real source path past a chain the user configured for policy/security
-/// reasons (Class A, ADR-0002).
+/// A self-referencing dialer, a reference to a name the config does not
+/// declare, or a dialer cycle is a hard config error — silently falling back to
+/// a direct dial would let traffic egress from the real source path past a
+/// chain the user configured for policy/security reasons (Class A, ADR-0002).
+/// A cycle has to be caught here in particular: late binding would turn it into
+/// unbounded recursion on the first dial. Cycles *through group membership* are
+/// checked separately by [`reject_group_membership_cycles`], which runs after
+/// the group build where the real membership is known.
 ///
-/// Note: this rewrites the registry entry, so direct rule references
-/// (`…,<proxy>`) and dialers that are groups both work. A proxy that is also a
-/// static member of a group keeps the dialer for direct references but not when
-/// reached via that group, because group members are resolved eagerly before
-/// this pass.
+/// Returns the applied `(proxy, dialer)` edges so the caller can re-validate
+/// dialer targets once groups have been built (a *declared* group that failed
+/// to build satisfies `dialable` but never enters the registry) and run
+/// [`reject_group_membership_cycles`] against the finished registry.
 fn apply_dialer_proxies(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    raw_groups: &[raw::RawProxyGroup],
+    registry: &meow_proxy::dialer::ProxyRegistry,
     ipv6: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
     // Collect proxy -> dialer edges from the raw config.
     //
     // Iterate in reverse and keep only the first sighting (the *last* block in
@@ -588,7 +599,7 @@ fn apply_dialer_proxies(
     // duplicate `name:` entries the last block is the effective definition.
     // Collecting edges from superseded duplicates would apply a chain the
     // effective block never declared.
-    let mut pending: Vec<(SmolStr, SmolStr)> = Vec::new();
+    let mut edges: Vec<(SmolStr, SmolStr)> = Vec::new();
     let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for raw_proxy in raw_proxies.iter().rev() {
         let Some(name) = raw_proxy.get("name").and_then(|v| v.as_str()) else {
@@ -597,112 +608,216 @@ fn apply_dialer_proxies(
         if !seen_names.insert(name) {
             continue;
         }
-        let Some(dialer) = raw_proxy
-            .get("dialer-proxy")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
+        let dialer = match raw_proxy.get("dialer-proxy") {
+            None => continue,
+            Some(v) => match v.as_str() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    warn!("proxy '{name}': ignoring malformed dialer-proxy value");
+                    continue;
+                }
+            },
         };
         if dialer == name {
             anyhow::bail!("proxy '{name}': dialer-proxy points to itself");
         }
-        pending.push((SmolStr::from(name), SmolStr::from(dialer)));
+        edges.push((SmolStr::from(name), SmolStr::from(dialer)));
     }
-    if pending.is_empty() {
-        return Ok(());
+    if edges.is_empty() {
+        return Ok(edges);
     }
 
-    // Names that declared a dialer-proxy — used to defer an edge until its
-    // dialer has reached its final wrapped form (nested dialer-proxies).
-    let needs_wrap: std::collections::HashSet<SmolStr> =
-        pending.iter().map(|(n, _)| n.clone()).collect();
-    let mut resolved: std::collections::HashSet<SmolStr> = std::collections::HashSet::new();
-
-    loop {
-        let mut progressed = false;
-        let mut deferred = Vec::new();
-        for (name, dialer) in std::mem::take(&mut pending) {
-            // Defer until the dialer is in its final form (either it never
-            // needed wrapping, or it has already been resolved this pass).
-            if needs_wrap.contains(&dialer) && !resolved.contains(&dialer) {
-                deferred.push((name, dialer));
-                continue;
-            }
-            progressed = true;
-            let Some(dialer_proxy) = proxies.get(&dialer).cloned() else {
-                anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
-            };
-            // Re-parse the raw block with a `ProxyDialer` injected (mihomo
-            // model), so the adapter's own dial + handshake runs on the
-            // tunneled stream.
-            //
-            // `rev()` matters: the registry-building loop above uses `insert`,
-            // so for a config with duplicate `name:` entries the *last* block
-            // wins. A forward `find` here would resurrect the *first* block and
-            // silently swap the running definition out from under the user.
-            let raw_proxy = raw_proxies
-                .iter()
-                .rev()
-                .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(&*name));
-            if let Some(raw) = raw_proxy {
-                let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> = Arc::new(
-                    meow_proxy::dialer::ProxyDialer::new(Arc::clone(&dialer_proxy)),
-                );
-                match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
-                    Ok(rebuilt) => {
-                        proxies.insert(name.clone(), rebuilt);
-                    }
-                    Err(e) => {
-                        // The adapter type cannot carry an injected dialer
-                        // (anytls, hysteria2, SS-with-external-SIP003-plugin) or
-                        // the block is otherwise unparseable. Fall back to the
-                        // relay-based `DialerProxyAdapter`, which preserves the
-                        // pre-dialer behaviour: it works for the protocols that
-                        // implement `connect_over` (HTTP/SOCKS5/Snell) and fails
-                        // loudly at dial time for the rest — never silently
-                        // dialing direct and leaking past the chain.
-                        //
-                        // The inner outbound may itself have failed to parse
-                        // earlier, in which case there is nothing to wrap.
-                        if let Some(inner) = proxies.get(&name).cloned() {
-                            warn!(
-                                "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
-                                 ({e}); falling back to the relay-based wrapper"
-                            );
-                            let wrapped: Arc<dyn Proxy> =
-                                Arc::new(meow_proxy::DialerProxyAdapter::new(inner, dialer_proxy));
-                            proxies.insert(name.clone(), wrapped);
-                        } else {
-                            warn!(
-                                "proxy '{name}': dialer-proxy '{dialer}' not applied \
-                                 ({e}); the outbound itself failed to parse"
-                            );
-                        }
-                    }
-                }
-            } else {
-                // Unreachable in practice — edges are only collected from blocks
-                // in this same list — but refuse instead of silently dialing
-                // direct if the invariant ever breaks.
-                anyhow::bail!(
-                    "proxy '{name}': dialer-proxy '{dialer}' not applied; no raw \
-                     config block found for this name"
-                );
-            }
-            resolved.insert(name);
+    // Names a dialer may reference. Leaf proxies are in the registry already;
+    // groups are built after this pass, so only their *declared* names count
+    // here, plus `GLOBAL`, which is auto-created when the config omits it.
+    let dialable: std::collections::HashSet<&str> = proxies
+        .keys()
+        .map(SmolStr::as_str)
+        .chain(raw_groups.iter().map(|group| group.name.as_str()))
+        .chain(std::iter::once("GLOBAL"))
+        .collect();
+    for (name, dialer) in &edges {
+        if !dialable.contains(dialer.as_str()) {
+            anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
         }
-        pending = deferred;
-        if pending.is_empty() || !progressed {
+    }
+
+    // Peel every edge whose dialer declares no dialer of its own. What survives
+    // is on a cycle or feeds one, and late binding would recurse forever on it.
+    let mut live: std::collections::HashSet<&SmolStr> = edges.iter().map(|(n, _)| n).collect();
+    loop {
+        let before = live.len();
+        for (name, dialer) in &edges {
+            if live.contains(name) && !live.contains(dialer) {
+                live.remove(name);
+            }
+        }
+        if live.is_empty() || live.len() == before {
             break;
         }
     }
-    if !pending.is_empty() {
-        let edges: Vec<String> = pending
+    if !live.is_empty() {
+        let cycle: Vec<String> = edges
             .iter()
+            .filter(|(name, _)| live.contains(name))
             .map(|(name, dialer)| format!("{name} -> {dialer}"))
             .collect();
-        anyhow::bail!("dialer-proxy cycle detected: {}", edges.join(", "));
+        anyhow::bail!("dialer-proxy cycle detected: {}", cycle.join(", "));
+    }
+
+    // Apply the edges. Order no longer matters — the front hop is resolved at
+    // dial time — so nested chains need no deepest-first deferral pass.
+    for (name, dialer) in &edges {
+        let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry.clone());
+        // `rev()` matters: the registry-building loop above uses `insert`, so
+        // for a config with duplicate `name:` entries the *last* block wins. A
+        // forward `find` here would resurrect the *first* block and silently
+        // swap the running definition out from under the user.
+        let Some(raw) = raw_proxies
+            .iter()
+            .rev()
+            .find(|rp| rp.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+        else {
+            // Unreachable in practice — edges are only collected from blocks in
+            // this same list — but refuse instead of silently dialing direct if
+            // the invariant ever breaks.
+            anyhow::bail!(
+                "proxy '{name}': dialer-proxy '{dialer}' not applied; no raw \
+                 config block found for this name"
+            );
+        };
+        // Re-parse the raw block with the by-name dialer injected (mihomo
+        // model), so the adapter's own dial + handshake runs on the tunneled
+        // stream.
+        let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()));
+        match proxy_parser::parse_proxy_with_dialer(raw, &proxy_dialer, ipv6) {
+            Ok(rebuilt) => {
+                proxies.insert(name.clone(), rebuilt);
+            }
+            Err(e) => {
+                // The adapter type cannot carry an injected dialer (anytls,
+                // hysteria2, SS-with-external-SIP003-plugin) or the block is
+                // otherwise unparseable. Fall back to the relay-based
+                // `DialerProxyAdapter`, which preserves the pre-dialer
+                // behaviour: it works for the protocols that implement
+                // `connect_over` (HTTP/SOCKS5/Snell) and fails loudly at dial
+                // time for the rest — never silently dialing direct and leaking
+                // past the chain.
+                //
+                // The inner outbound may itself have failed to parse earlier,
+                // in which case there is nothing to wrap.
+                if let Some(inner) = proxies.get(name).cloned() {
+                    warn!(
+                        "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                         ({e}); falling back to the relay-based wrapper"
+                    );
+                    let wrapped: Arc<dyn Proxy> =
+                        Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
+                    proxies.insert(name.clone(), wrapped);
+                } else {
+                    warn!(
+                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
+                         ({e}); the outbound itself failed to parse"
+                    );
+                }
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// Reject any `dialer-proxy` edge whose target can route the front-hop dial
+/// back to the chained proxy through group membership — a loop that never
+/// reaches I/O: it is synchronous nested polls and exhausts the native stack
+/// on the first dial (mihomo's `validateDialerProxies` only sees proxy→proxy
+/// edges and has the same blind spot).
+///
+/// Runs after the group build so the model matches the *built* registry:
+/// groups that failed to build contribute no membership edges, and a declared
+/// `GLOBAL` that failed to build is backstopped by the auto-created one
+/// holding every registry entry — modelling declared membership before the
+/// build would miss both.
+///
+/// Conservative over-approximations, all fail-closed: `include-all-proxies`
+/// expands to the final registry (the build itself saw a mid-pass subset);
+/// duplicate group declarations are unioned (the registry keeps the last
+/// *successful* build, not the last declaration); relay members are all
+/// treated as reachable heads (only the first member's dialer can actually
+/// fire); provider-slot members (`use:` / `include-all`) are dead ends —
+/// provider nodes never carry a `dialer-proxy`.
+fn reject_group_membership_cycles(
+    edges: &[(SmolStr, SmolStr)],
+    raw_groups: &[raw::RawProxyGroup],
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    global_auto_created: bool,
+) -> Result<(), anyhow::Error> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let mut members_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for group in raw_groups {
+        if !proxies.contains_key(group.name.as_str()) {
+            // Never built — its entry is absent, so it contributes no
+            // membership edges at runtime.
+            continue;
+        }
+        let mut members: Vec<&str> = group
+            .proxies
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
+            .filter(|m| proxies.contains_key(*m))
+            .collect();
+        if group.include_all_proxies.unwrap_or(false) {
+            members.extend(proxies.keys().map(SmolStr::as_str));
+        }
+        members_of
+            .entry(group.name.as_str())
+            .or_default()
+            .extend(members);
+    }
+    if global_auto_created {
+        members_of
+            .entry("GLOBAL")
+            .or_default()
+            .extend(proxies.keys().map(SmolStr::as_str));
+    }
+    // Only edges whose source actually entered the registry produce a wrapped
+    // adapter; an unparseable source can never fire its chain, so following
+    // its edge would be a phantom.
+    let edge_map: HashMap<&str, &str> = edges
+        .iter()
+        .filter(|(name, _)| proxies.contains_key(name))
+        .map(|(name, dialer)| (name.as_str(), dialer.as_str()))
+        .collect();
+    // DFS from each dialer over dialer edges and membership edges; reaching the
+    // edge's source means the first dial recurses without bound.
+    for (name, dialer) in edges {
+        if !proxies.contains_key(name) {
+            continue;
+        }
+        let mut stack: Vec<&str> = vec![dialer.as_str()];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(node) = stack.pop() {
+            if node == name.as_str() {
+                anyhow::bail!(
+                    "proxy '{name}': dialer-proxy '{dialer}' can route back to \
+                     '{name}' through group membership, which would recurse \
+                     forever on the first dial"
+                );
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(next) = edge_map.get(node) {
+                stack.push(next);
+            }
+            if let Some(members) = members_of.get(node) {
+                stack.extend(members.iter().copied());
+            }
+        }
     }
     Ok(())
 }
@@ -780,6 +895,9 @@ fn rebuild_from_raw_impl(
 ) -> Result<RebuildResult, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+    // `dialer-proxy` front hops are resolved by name against this registry on
+    // every dial; it is published once the build below has finished.
+    let registry = meow_proxy::dialer::ProxyRegistry::default();
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
     if let Some(mark) = raw.routing_mark {
@@ -827,9 +945,23 @@ fn rebuild_from_raw_impl(
         }
     }
 
+    let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
+
+    // Apply per-outbound `dialer-proxy` chains (issue #210) *before* groups are
+    // built: groups clone their members eagerly, so a chain applied afterwards
+    // would only cover direct rule references and a grouped node would silently
+    // bypass it (issue #513). The front hop is resolved by name at dial time,
+    // which is what lets a dialer name a group that does not exist yet here.
+    let dialer_edges = apply_dialer_proxies(
+        &mut proxies,
+        raw.proxies.as_deref().unwrap_or(&[]),
+        raw_groups,
+        &registry,
+        ipv6,
+    )?;
+
     // Multi-pass group resolution: groups can reference other groups.
     // Keep trying until no new groups are resolved.
-    let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
     let mut remaining: Vec<&raw::RawProxyGroup> = raw_groups.iter().collect();
     let mut max_passes = remaining.len() + 1;
     while !remaining.is_empty() && max_passes > 0 {
@@ -881,7 +1013,8 @@ fn rebuild_from_raw_impl(
     // outbound first: SelectorGroup uses its first member when no choice has
     // been stored, and sorting every registry key previously made global mode
     // default to DIRECT or an alphabetically-first quota/expiry pseudo-node.
-    if !proxies.contains_key("GLOBAL") {
+    let had_global = proxies.contains_key("GLOBAL");
+    if !had_global {
         let mut all_proxy_names: Vec<String> = proxies
             .keys()
             .map(std::string::ToString::to_string)
@@ -916,10 +1049,37 @@ fn rebuild_from_raw_impl(
             Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
         }
     }
+    // Whether `GLOBAL` is the auto-created all-registry selector or a declared
+    // group changes what a `dialer-proxy: GLOBAL` edge can reach.
+    let global_auto_created = !had_global && proxies.contains_key("GLOBAL");
 
-    // Apply per-outbound `dialer-proxy` wrappers (issue #210). Runs after both
-    // leaf proxies and groups are built so a dialer may reference either.
-    apply_dialer_proxies(&mut proxies, raw.proxies.as_deref().unwrap_or(&[]), ipv6)?;
+    // `dialable` admitted *declared* group names before the group build ran;
+    // a group that failed to build never entered the registry, so re-check
+    // every dialer target against the finished map instead of letting the
+    // first dial report it late.
+    for (name, dialer) in &dialer_edges {
+        if !proxies.contains_key(dialer.as_str()) {
+            anyhow::bail!(
+                "proxy '{name}': dialer-proxy '{dialer}' is declared but did \
+                 not build into a registry entry"
+            );
+        }
+    }
+
+    // Cycles that run through group membership — including a declared-but-
+    // failed GLOBAL that the auto-create just backstopped — are only decidable
+    // now that the registry is finished.
+    reject_group_membership_cycles(&dialer_edges, raw_groups, &proxies, global_auto_created)?;
+
+    // Publish the finished registry: the `dialer-proxy` chains bound above
+    // resolve their front hop by name against it, and only now does it hold the
+    // groups they may name (issue #513). Nothing mutates `proxies` after this
+    // point, and publishing *before* the provider fetches below matters: they
+    // dial through `download_proxy`, which may itself be a chained node whose
+    // front hop must already resolve. A later rebuild publishes into its own
+    // registry, so adapters already handed to the tunnel keep resolving the
+    // snapshot they were built from.
+    registry.publish(Arc::new(proxies.clone()));
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
     // Per-provider `proxy:` overrides resolve against the full registry —
@@ -2203,12 +2363,44 @@ mod dialer_proxy_tests {
         !Arc::ptr_eq(b, a)
     }
 
+    /// Run the dialer pass against a fresh by-name registry and publish it on
+    /// success, the way `rebuild_from_raw_impl` does — without the publish the
+    /// chained adapters cannot resolve their front hop at dial time.
+    fn apply_chains(
+        proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
+        raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    ) -> Result<(), anyhow::Error> {
+        apply_chains_with_groups(proxies, raw_proxies, &[])
+    }
+
+    /// Same as [`apply_chains`] but with declared `proxy-groups`, so tests can
+    /// exercise group-valued dialers and the membership cycle check. Stands in
+    /// for the group build by giving every declared group a registry entry —
+    /// the cycle check models declared membership, so what the entry *is*
+    /// does not matter, only that it exists.
+    fn apply_chains_with_groups(
+        proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
+        raw_proxies: &[HashMap<String, serde_yaml::Value>],
+        raw_groups: &[raw::RawProxyGroup],
+    ) -> Result<(), anyhow::Error> {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let edges = apply_dialer_proxies(proxies, raw_proxies, raw_groups, &registry, true)?;
+        for group in raw_groups {
+            proxies
+                .entry(SmolStr::from(group.name.as_str()))
+                .or_insert_with(|| simple_proxy(&group.name));
+        }
+        let global_auto_created = !proxies.contains_key("GLOBAL");
+        reject_group_membership_cycles(&edges, raw_groups, proxies, global_auto_created)?;
+        registry.publish(Arc::new(proxies.clone()));
+        Ok(())
+    }
+
     #[test]
     fn wraps_proxy_with_dialer() {
         let mut proxies = registry(&["A", "fast"]);
         let before = proxies.clone();
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("fast"))], true)
-            .expect("valid chain applies");
+        apply_chains(&mut proxies, &[raw_proxy("A", Some("fast"))]).expect("valid chain applies");
         assert!(was_wrapped(&before, &proxies, "A"));
         assert!(!was_wrapped(&before, &proxies, "fast"));
     }
@@ -2217,7 +2409,7 @@ mod dialer_proxy_tests {
     fn self_reference_is_a_config_error() {
         let mut proxies = registry(&["A"]);
         let before = proxies.clone();
-        let err = apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("A"))], true)
+        let err = apply_chains(&mut proxies, &[raw_proxy("A", Some("A"))])
             .expect_err("a self-referencing dialer must not silently dial direct");
         assert!(
             err.to_string().contains("points to itself"),
@@ -2230,7 +2422,7 @@ mod dialer_proxy_tests {
     fn missing_dialer_is_a_config_error() {
         let mut proxies = registry(&["A"]);
         let before = proxies.clone();
-        let err = apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("ghost"))], true)
+        let err = apply_chains(&mut proxies, &[raw_proxy("A", Some("ghost"))])
             .expect_err("an unknown dialer must not silently dial direct");
         assert!(err.to_string().contains("not found"), "unexpected: {err}");
         assert!(!was_wrapped(&before, &proxies, "A"));
@@ -2240,15 +2432,155 @@ mod dialer_proxy_tests {
     fn cycle_is_a_config_error() {
         let mut proxies = registry(&["A", "B"]);
         let before = proxies.clone();
-        let err = apply_dialer_proxies(
+        let err = apply_chains(
             &mut proxies,
             &[raw_proxy("A", Some("B")), raw_proxy("B", Some("A"))],
-            true,
         )
         .expect_err("a dialer cycle must not silently dial direct");
         assert!(err.to_string().contains("cycle"), "unexpected: {err}");
         assert!(!was_wrapped(&before, &proxies, "A"));
         assert!(!was_wrapped(&before, &proxies, "B"));
+    }
+
+    /// A cycle that only *some* of the edges sit on still has to be rejected:
+    /// late binding recurses through the whole chain, so `A` feeding `B <-> C`
+    /// never terminates either.
+    #[test]
+    fn chain_feeding_a_cycle_is_a_config_error() {
+        let mut proxies = registry(&["A", "B", "C"]);
+        let before = proxies.clone();
+        let err = apply_chains(
+            &mut proxies,
+            &[
+                raw_proxy("A", Some("B")),
+                raw_proxy("B", Some("C")),
+                raw_proxy("C", Some("B")),
+            ],
+        )
+        .expect_err("an edge feeding a cycle must not silently dial direct");
+        assert!(err.to_string().contains("cycle"), "unexpected: {err}");
+        assert!(!was_wrapped(&before, &proxies, "A"));
+    }
+
+    fn raw_group(name: &str, members: &[&str]) -> raw::RawProxyGroup {
+        raw::RawProxyGroup {
+            name: name.to_string(),
+            group_type: "select".to_string(),
+            proxies: Some(members.iter().map(ToString::to_string).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// A group-valued dialer whose membership can route back to the chained
+    /// proxy recurses without ever reaching I/O — synchronous nested polls
+    /// exhaust the native stack on the first dial. The combined
+    /// dialer-edge + membership-edge check must reject it (mihomo's
+    /// `validateDialerProxies` misses this class entirely).
+    #[test]
+    fn group_selecting_self_is_a_config_error() {
+        let mut proxies = registry(&["A", "B"]);
+        let err = apply_chains_with_groups(
+            &mut proxies,
+            &[raw_proxy("A", Some("G"))],
+            &[raw_group("G", &["A", "B"])],
+        )
+        .expect_err("a dialer that can route back to its source must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The same loop one group hop away: `G1` holds `G2`, `G2` holds `A`.
+    #[test]
+    fn nested_group_selecting_self_is_a_config_error() {
+        let mut proxies = registry(&["A", "B"]);
+        let err = apply_chains_with_groups(
+            &mut proxies,
+            &[raw_proxy("A", Some("G1"))],
+            &[raw_group("G1", &["G2"]), raw_group("G2", &["A", "B"])],
+        )
+        .expect_err("a transitive self-route must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A loop that alternates dialer edges and membership edges:
+    /// `A -> G`, `G` holds `B`, `B -> A`.
+    #[test]
+    fn group_and_dialer_cycle_is_a_config_error() {
+        let mut proxies = registry(&["A", "B"]);
+        let err = apply_chains_with_groups(
+            &mut proxies,
+            &[raw_proxy("A", Some("G")), raw_proxy("B", Some("A"))],
+            &[raw_group("G", &["B"])],
+        )
+        .expect_err("a membership+dialer cycle must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// The auto-created `GLOBAL` contains every registry entry, so chaining
+    /// through it always routes back to the source.
+    #[test]
+    fn auto_global_dialer_is_a_config_error() {
+        let mut proxies = registry(&["A", "B"]);
+        let err = apply_chains_with_groups(&mut proxies, &[raw_proxy("A", Some("GLOBAL"))], &[])
+            .expect_err("chaining through auto-GLOBAL must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// `include-all-proxies` expands to every registry name — same self-route.
+    #[test]
+    fn include_all_proxies_group_is_a_config_error() {
+        let mut proxies = registry(&["A", "B"]);
+        let mut g = raw_group("G", &[]);
+        g.include_all_proxies = Some(true);
+        let err = apply_chains_with_groups(&mut proxies, &[raw_proxy("A", Some("G"))], &[g])
+            .expect_err("an include-all-proxies dialer must be rejected");
+        assert!(
+            err.to_string().contains("through group membership"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A group-valued dialer that cannot reach back to its source is fine.
+    #[test]
+    fn group_not_containing_self_is_allowed() {
+        let mut proxies = registry(&["A", "B"]);
+        let before = proxies.clone();
+        apply_chains_with_groups(
+            &mut proxies,
+            &[raw_proxy("A", Some("G"))],
+            &[raw_group("G", &["B"])],
+        )
+        .expect("a group dialer that cannot route back is valid");
+        assert!(was_wrapped(&before, &proxies, "A"));
+    }
+
+    /// A malformed `dialer-proxy` value is warned about and skipped — the node
+    /// keeps its direct dialer rather than dying on a typo.
+    #[test]
+    fn malformed_dialer_proxy_is_ignored() {
+        let mut proxies = registry(&["A", "B"]);
+        let before = proxies.clone();
+        let mut raw = raw_proxy("A", None);
+        raw.insert(
+            "dialer-proxy".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+        );
+        apply_chains(&mut proxies, &[raw]).expect("malformed dialer-proxy is skipped");
+        assert!(
+            !was_wrapped(&before, &proxies, "A"),
+            "a non-string dialer-proxy must not apply a chain"
+        );
     }
 
     /// Duplicate `name:` blocks: only the *last* block is the effective
@@ -2270,8 +2602,7 @@ mod dialer_proxy_tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
         );
 
-        apply_dialer_proxies(&mut proxies, &[first, last], true)
-            .expect("the effective block declares no dialer");
+        apply_chains(&mut proxies, &[first, last]).expect("the effective block declares no dialer");
 
         assert!(
             !was_wrapped(&before, &proxies, "A"),
@@ -2281,14 +2612,15 @@ mod dialer_proxy_tests {
     }
 
     #[test]
-    fn nested_chain_wraps_deepest_first() {
-        // A -> B -> C: A and B are wrapped, C (no dialer-proxy) is untouched.
+    fn nested_chain_wraps_every_layer() {
+        // A -> B -> C: A and B are chained, C (no dialer-proxy) is untouched.
+        // The front hop is resolved at dial time, so neither layer has to wait
+        // for the other to reach its final form.
         let mut proxies = registry(&["A", "B", "C"]);
         let before = proxies.clone();
-        apply_dialer_proxies(
+        apply_chains(
             &mut proxies,
             &[raw_proxy("A", Some("B")), raw_proxy("B", Some("C"))],
-            true,
         )
         .expect("valid nested chain applies");
         assert!(was_wrapped(&before, &proxies, "A"));
@@ -2346,12 +2678,8 @@ mod dialer_proxy_tests {
         proxies.insert(SmolStr::from("A"), parsed_a);
         let before = proxies.clone();
 
-        apply_dialer_proxies(
-            &mut proxies,
-            &[raw_socks5_proxy("A", Some("front"), true)],
-            true,
-        )
-        .expect("valid chain applies");
+        apply_chains(&mut proxies, &[raw_socks5_proxy("A", Some("front"), true)])
+            .expect("valid chain applies");
 
         assert!(was_wrapped(&before, &proxies, "A"), "A should be re-parsed");
         assert!(
@@ -2391,12 +2719,8 @@ mod dialer_proxy_tests {
             let mut proxies = registry(&["A", "front"]);
             let before = proxies.clone();
 
-            apply_dialer_proxies(
-                &mut proxies,
-                &[raw_typed_proxy("A", ty, Some("front"))],
-                true,
-            )
-            .expect("valid chain applies via the wrapper fallback");
+            apply_chains(&mut proxies, &[raw_typed_proxy("A", ty, Some("front"))])
+                .expect("valid chain applies via the wrapper fallback");
 
             let after = proxies.get("A").expect("entry survives");
             assert!(
@@ -2434,8 +2758,7 @@ mod dialer_proxy_tests {
 
         // Must not panic and must not spawn: the parse is rejected before
         // `ShadowsocksAdapter::new` runs, so the fallback wrapper is used.
-        apply_dialer_proxies(&mut proxies, &[raw], true)
-            .expect("valid chain applies via the wrapper fallback");
+        apply_chains(&mut proxies, &[raw]).expect("valid chain applies via the wrapper fallback");
 
         assert!(
             proxies.contains_key("A"),
@@ -2461,7 +2784,7 @@ mod dialer_proxy_tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(2222)),
         );
 
-        apply_dialer_proxies(&mut proxies, &[first, last], true).expect("valid chain applies");
+        apply_chains(&mut proxies, &[first, last]).expect("valid chain applies");
 
         let rebuilt = proxies.get("A").expect("present after");
         assert_eq!(
@@ -2485,7 +2808,7 @@ mod dialer_proxy_tests {
         let before = proxies.clone();
 
         // raw_proxy has no `type` → parse_proxy_with_dialer fails → fallback.
-        apply_dialer_proxies(&mut proxies, &[raw_proxy("A", Some("front"))], true)
+        apply_chains(&mut proxies, &[raw_proxy("A", Some("front"))])
             .expect("valid chain applies via the wrapper fallback");
 
         assert!(
@@ -2619,8 +2942,7 @@ mod dialer_proxy_tests {
             proxy_parser::parse_proxy(&raw_inner, true).expect("parse inner"),
         );
 
-        apply_dialer_proxies(&mut proxies, &[raw_front, raw_inner], true)
-            .expect("valid chain applies");
+        apply_chains(&mut proxies, &[raw_front, raw_inner]).expect("valid chain applies");
 
         // Dial a final target through `inner`; `inner` must reach its own
         // server (127.0.0.1:inner_port) *via* `front`.

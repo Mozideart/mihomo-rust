@@ -128,11 +128,27 @@ pub fn parse_header(data: &[u8]) -> Result<(MrsHeader, &[u8]), MrsError> {
     ))
 }
 
+/// Largest accepted *decompressed* mrs/geosite payload. The HTTP body cap
+/// (`internal_http::MAX_BODY_BYTES`) bounds only the compressed wire bytes;
+/// the zstd expansion ratio is attacker-chosen, so an unbounded `read_to_end`
+/// would let a small payload grow `out` until allocation aborts the process
+/// (issue #513).
+const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Decompress the zstd-compressed payload that follows an mrs header.
 pub fn decompress_payload(compressed: &[u8]) -> Result<Vec<u8>, MrsError> {
-    let mut out = Vec::new();
+    decompress_payload_bounded(compressed, MAX_DECOMPRESSED_BYTES)
+}
+
+fn decompress_payload_bounded(compressed: &[u8], max: u64) -> Result<Vec<u8>, MrsError> {
     let mut decoder = zstd::stream::Decoder::new(Cursor::new(compressed))?;
-    decoder.read_to_end(&mut out)?;
+    let mut out = Vec::new();
+    // Read one byte past the bound so an over-limit payload is an error rather
+    // than silently truncated input.
+    let n = std::io::Read::take(&mut decoder, max + 1).read_to_end(&mut out)?;
+    if n as u64 > max {
+        return Err(MrsError::InvalidLength("decompressed_payload", max as i64));
+    }
     Ok(out)
 }
 
@@ -171,7 +187,9 @@ pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload
     if extra_len < 0 {
         return Err(MrsError::InvalidReservedLength(extra_len));
     }
-    let _ = r.read_slice("extra", extra_len as usize)?;
+    let extra_len =
+        usize::try_from(extra_len).map_err(|_| MrsError::InvalidLength("extra_len", extra_len))?;
+    let _ = r.read_slice("extra", extra_len)?;
 
     let body = r.remaining_slice();
     let entries = match behavior {
@@ -182,7 +200,7 @@ pub fn parse_upstream_ruleset_mrs(bytes: &[u8]) -> Result<UpstreamRuleSetPayload
 
     Ok(UpstreamRuleSetPayload {
         behavior,
-        count: count as usize,
+        count: usize::try_from(count).map_err(|_| MrsError::InvalidLength("count", count))?,
         entries,
     })
 }
@@ -199,7 +217,25 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
     if labels_len < 1 {
         return Err(MrsError::InvalidLength("domain_set_labels_len", labels_len));
     }
-    let labels = r.read_slice("domain_set_labels", labels_len as usize)?;
+    let labels_len = usize::try_from(labels_len)
+        .map_err(|_| MrsError::InvalidLength("domain_set_labels_len", labels_len))?;
+    let labels = r.read_slice("domain_set_labels", labels_len)?;
+
+    // A well-formed trie has exactly one terminator bit per node and every
+    // non-root node owns one incoming label edge, so #ones <= labels + 1.
+    // Enforce the correlation *before* DomainSetIndex materializes one `usize`
+    // per set bit — a mostly-ones bitmap would otherwise amplify the input
+    // ~64x into memory (issue #513).
+    let node_count: usize = label_bitmap
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum();
+    if node_count > labels.len() + 1 {
+        return Err(MrsError::InvalidLength(
+            "domain_set_terminators",
+            node_count as i64,
+        ));
+    }
 
     let traversal = DomainSetTraversal {
         leaves: &leaves,
@@ -209,7 +245,7 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
     };
     let mut reversed = Vec::new();
     let mut current = Vec::new();
-    traversal.traverse(0, 0, &mut current, &mut reversed);
+    traversal.traverse(0, 0, &mut current, &mut reversed)?;
 
     Ok(reversed
         .into_iter()
@@ -218,11 +254,19 @@ fn parse_upstream_domain_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
 }
 
 fn read_u64_vec(r: &mut ByteReader<'_>, what: &'static str) -> Result<Vec<u64>, MrsError> {
-    let len = r.read_i64_be(what)?;
-    if len < 1 {
-        return Err(MrsError::InvalidLength(what, len));
+    let declared = r.read_i64_be(what)?;
+    if declared < 1 {
+        return Err(MrsError::InvalidLength(what, declared));
     }
-    let mut out = Vec::with_capacity(len as usize);
+    // The word count comes from a remote rule-provider, so prove the bytes are
+    // actually present before reserving: `with_capacity` on a bogus count trips
+    // the capacity-overflow check and aborts the process (issue #513).
+    let len = usize::try_from(declared).map_err(|_| MrsError::InvalidLength(what, declared))?;
+    let bytes = len
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(MrsError::InvalidLength(what, declared))?;
+    r.need(what, bytes)?;
+    let mut out = Vec::with_capacity(len);
     for _ in 0..len {
         out.push(r.read_u64_be(what)?);
     }
@@ -236,40 +280,103 @@ struct DomainSetTraversal<'a> {
     labels: &'a [u8],
 }
 
+/// Hard bounds on decoded domain-set output. Real-world rule sets top out at a
+/// few million short domains; a hostile file can otherwise turn input bytes
+/// into roughly O(input²) output — each reachable leaf clones a label path of
+/// up to `labels.len()` bytes — exhausting memory without tripping any input
+/// check (issue #513).
+const MAX_DOMAIN_SET_ENTRIES: usize = 4 * 1024 * 1024;
+const MAX_DOMAIN_SET_BYTES: usize = 256 * 1024 * 1024;
+/// A domain never exceeds 253 octets of labels, so a legitimate trie walk is
+/// ~127 frames deep at most; 4 Ki frames is generous headroom. Without the
+/// cap the explicit stack and `current` still grow proportionally to remote
+/// input — a deep-chain gadget turns a bounded payload into GiBs of frames.
+const MAX_DOMAIN_SET_DEPTH: usize = 4 * 1024;
+
 impl DomainSetTraversal<'_> {
     fn traverse(
         &self,
-        node_id: usize,
-        bm_idx: usize,
+        root_node: usize,
+        root_bm: usize,
         current: &mut Vec<u8>,
         out: &mut Vec<Vec<u8>>,
-    ) {
-        if get_bit(self.leaves, node_id) {
+    ) -> Result<(), MrsError> {
+        self.traverse_bounded(
+            root_node,
+            root_bm,
+            current,
+            out,
+            MAX_DOMAIN_SET_ENTRIES,
+            MAX_DOMAIN_SET_BYTES,
+            MAX_DOMAIN_SET_DEPTH,
+        )
+    }
+
+    /// Depth-first walk of the label graph, iterative because the input is
+    /// remote-controlled: recursion depth is proportional to input size and
+    /// would overflow the (small) stack of the spawned provider-fetch thread.
+    ///
+    /// Frame discipline: `current` holds one label byte per frame above the
+    /// root, so `current.len() == stack.len() - 1` is an invariant.
+    #[allow(clippy::too_many_arguments, reason = "bounds grouped for tests")]
+    fn traverse_bounded(
+        &self,
+        root_node: usize,
+        root_bm: usize,
+        current: &mut Vec<u8>,
+        out: &mut Vec<Vec<u8>>,
+        max_entries: usize,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<(), MrsError> {
+        let mut out_bytes = 0usize;
+        let mut stack: Vec<(usize, usize)> = vec![(root_node, root_bm)];
+        if get_bit(self.leaves, root_node) {
             out.push(current.clone());
         }
-
-        let mut idx = bm_idx;
-        loop {
-            if get_bit(self.label_bitmap, idx) {
-                return;
-            }
-
-            let label_idx = idx.saturating_sub(node_id);
-            let Some(&label) = self.labels.get(label_idx) else {
-                return;
+        while let Some(top) = stack.last_mut() {
+            let (node_id, idx) = *top;
+            // A terminator bit, an out-of-range label, or a missing child node
+            // all end this frame exactly as the recursive `return` did.
+            let child = if get_bit(self.label_bitmap, idx) {
+                None
+            } else {
+                let label_idx = idx.saturating_sub(node_id);
+                let next_node_id = self.label_index.count_zeros(self.label_bitmap, idx + 1);
+                self.labels
+                    .get(label_idx)
+                    .copied()
+                    .zip(self.label_index.select_one(next_node_id.saturating_sub(1)))
+                    .map(|(label, prev_terminator)| (label, next_node_id, prev_terminator + 1))
             };
-            let next_node_id = self.label_index.count_zeros(self.label_bitmap, idx + 1);
-            let Some(prev_terminator) = self.label_index.select_one(next_node_id.saturating_sub(1))
-            else {
-                return;
+            let Some((label, next_node_id, next_bm_idx)) = child else {
+                stack.pop();
+                if !stack.is_empty() {
+                    current.pop();
+                }
+                continue;
             };
-            let next_bm_idx = prev_terminator + 1;
-
+            top.1 = idx + 1;
             current.push(label);
-            self.traverse(next_node_id, next_bm_idx, current, out);
-            current.pop();
-            idx += 1;
+            if get_bit(self.leaves, next_node_id) {
+                if out.len() >= max_entries || out_bytes + current.len() > max_bytes {
+                    return Err(MrsError::InvalidLength(
+                        "domain_set_output",
+                        out.len() as i64,
+                    ));
+                }
+                out_bytes += current.len();
+                out.push(current.clone());
+            }
+            if stack.len() >= max_depth {
+                return Err(MrsError::InvalidLength(
+                    "domain_set_depth",
+                    stack.len() as i64,
+                ));
+            }
+            stack.push((next_node_id, next_bm_idx));
         }
+        Ok(())
     }
 }
 
@@ -342,6 +449,14 @@ fn parse_upstream_ipcidr_set(data: &[u8]) -> Result<Vec<String>, MrsError> {
         let from = IpAddr::from(Ipv6Addr::from(from));
         let to = IpAddr::from(Ipv6Addr::from(to));
         push_range_prefixes(from, to, &mut out);
+        // One 32-byte record can expand to over a hundred CIDR strings; bound
+        // the total or a max-size payload amplifies ~100x (issue #513).
+        if out.len() > MAX_DOMAIN_SET_ENTRIES {
+            return Err(MrsError::InvalidLength(
+                "ipcidr_set_output",
+                out.len() as i64,
+            ));
+        }
     }
     Ok(out)
 }
@@ -423,15 +538,24 @@ pub fn parse_geosite_payload(
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> Result<GeositePayload, MrsError> {
     let mut r = ByteReader::new(decompressed);
-    let cat_count = r.read_u32_be("category_count")?;
-    let mut categories = Vec::with_capacity(cat_count as usize);
+    let cat_count = r.read_u32_be("category_count")? as usize;
+    // Both counts come from a remote geodata file. Reserving them verbatim asks
+    // for hundreds of gigabytes on a bogus count, which aborts under the
+    // workspace's `panic = "abort"`; cap at what the input can actually hold —
+    // an empty category still costs a u16 name length plus a u32 domain count,
+    // and an empty domain still costs a u16 length.
+    let mut categories = Vec::with_capacity(bounded_capacity::<(String, Vec<String>)>(
+        cat_count,
+        r.remaining(),
+        6,
+    ));
     for _ in 0..cat_count {
         let name_len = r.read_u16_be("category_name_len")? as usize;
         let name_bytes = r.read_slice("category_name", name_len)?;
         let name = String::from_utf8(name_bytes.to_vec())
             .map_err(|e| MrsError::Utf8("category_name", e))?
             .to_ascii_lowercase();
-        let dom_count = r.read_u32_be("domain_count")?;
+        let dom_count = r.read_u32_be("domain_count")? as usize;
 
         // If an allow-set is active and this category is not in it, skip its
         // domains at the byte level — read lengths and advance the cursor
@@ -446,7 +570,8 @@ pub fn parse_geosite_payload(
             }
         }
 
-        let mut domains = Vec::with_capacity(dom_count as usize);
+        let mut domains =
+            Vec::with_capacity(bounded_capacity::<String>(dom_count, r.remaining(), 2));
         for _ in 0..dom_count {
             let dom_len = r.read_u16_be("domain_len")? as usize;
             let dom_bytes = r.read_slice("domain", dom_len)?;
@@ -458,6 +583,19 @@ pub fn parse_geosite_payload(
         categories.push((name, domains));
     }
     Ok(GeositePayload { categories })
+}
+
+/// Cap a reservation derived from a declared element count at what the
+/// remaining input can actually hold, given the smallest encoded size of one
+/// element. The declared counts are remote-controlled; without the cap a bogus
+/// count becomes an allocation failure rather than a `Truncated` error.
+///
+/// The divisor also accounts for the element's *decoded* size: without it the
+/// reservation can still reach ~8–12× the input (a 48-byte element against a
+/// 6-byte minimum encoding), which turns a large-but-legitimate input into an
+/// oversized allocation.
+fn bounded_capacity<T>(declared: usize, remaining: usize, min_element_bytes: usize) -> usize {
+    declared.min(remaining / min_element_bytes.max(std::mem::size_of::<T>()))
 }
 
 /// Encode a `GeositePayload` into the uncompressed inner payload bytes.
@@ -526,13 +664,22 @@ impl<'a> ByteReader<'a> {
         &self.data[self.pos..]
     }
 
+    /// Unread byte count. Saturating because a hostile declared length can push
+    /// `pos` arithmetic that would otherwise wrap.
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
     fn need(&self, what: &'static str, n: usize) -> Result<(), MrsError> {
-        if self.pos + n > self.data.len() {
+        // Compare against the remaining length rather than `pos + n`: a declared
+        // length near `usize::MAX` would wrap the sum and pass the check.
+        let have = self.remaining();
+        if n > have {
             return Err(MrsError::Truncated {
                 what,
                 offset: self.pos,
                 need: n,
-                have: self.data.len() - self.pos,
+                have,
             });
         }
         Ok(())
@@ -683,18 +830,22 @@ mod tests {
             idx += 1;
         }
 
+        encode_domain_set_raw(&leaves, &label_bitmap, &labels)
+    }
+
+    fn encode_domain_set_raw(leaves: &[u64], label_bitmap: &[u64], labels: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(1);
         write_i64(&mut out, leaves.len() as i64);
         for word in leaves {
-            write_u64(&mut out, word);
+            write_u64(&mut out, *word);
         }
         write_i64(&mut out, label_bitmap.len() as i64);
         for word in label_bitmap {
-            write_u64(&mut out, word);
+            write_u64(&mut out, *word);
         }
         write_i64(&mut out, labels.len() as i64);
-        out.extend_from_slice(&labels);
+        out.extend_from_slice(labels);
         out
     }
 
@@ -797,5 +948,196 @@ mod tests {
         let parsed = parse_upstream_ruleset_mrs(&bytes).unwrap();
         assert_eq!(parsed.behavior, TYPE_IPCIDR);
         assert_eq!(parsed.entries, vec!["192.168.0.0/24"]);
+    }
+
+    /// A remote rule-provider can declare an enormous word count in a payload
+    /// only a few dozen bytes long. Both `read_u64_vec` call sites must reject
+    /// it with an error: reserving from the declared count trips the
+    /// capacity-overflow check, which terminates the process under the
+    /// workspace's `panic = "abort"` release profile (issue #513).
+    #[test]
+    fn upstream_ruleset_mrs_oversized_word_counts_are_rejected() {
+        // `i64::MAX` overflows the byte-count multiplication; `i64::MAX / 8 + 1`
+        // does not and must instead be caught by the remaining-input check.
+        for declared in [i64::MAX, i64::MAX / 8 + 1, 100] {
+            let mut leaves = vec![1u8];
+            write_i64(&mut leaves, declared);
+            assert!(
+                parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, 1, &leaves)).is_err(),
+                "leaves_len={declared} must not reserve from the declared count"
+            );
+
+            let mut bitmap = vec![1u8];
+            write_i64(&mut bitmap, 1);
+            write_u64(&mut bitmap, 0);
+            write_i64(&mut bitmap, declared);
+            assert!(
+                parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, 1, &bitmap)).is_err(),
+                "label_bitmap_len={declared} must not reserve from the declared count"
+            );
+        }
+    }
+
+    /// Same class on the geodata path: `category_count` and `domain_count` are
+    /// u32 values from a remote geodata file, so the reservation has to be
+    /// capped by the input rather than asking for hundreds of gigabytes.
+    #[test]
+    fn geosite_payload_declared_counts_are_bounded_by_input() {
+        assert!(parse_geosite_payload(&u32::MAX.to_be_bytes(), None).is_err());
+
+        let mut category_without_domains = Vec::new();
+        category_without_domains.extend_from_slice(&1u32.to_be_bytes());
+        category_without_domains.extend_from_slice(b"cn");
+        category_without_domains.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_geosite_payload(&category_without_domains, None).is_err());
+    }
+
+    /// The wire cap bounds only the *compressed* bytes; zstd expansion is
+    /// attacker-chosen, so decompression itself must be bounded or a small
+    /// payload can allocate until abort (issue #513).
+    #[test]
+    fn decompress_payload_rejects_output_past_the_bound() {
+        let inner = vec![0u8; 1024];
+        let compressed = zstd::encode_all(Cursor::new(&inner), 0).unwrap();
+        assert_eq!(
+            decompress_payload_bounded(&compressed, 512)
+                .unwrap_err()
+                .to_string(),
+            "mrs: invalid length for decompressed_payload: 512"
+        );
+        assert_eq!(
+            decompress_payload_bounded(&compressed, 1024).unwrap(),
+            inner
+        );
+    }
+
+    /// A crafted label graph can chain one traversal frame per few input
+    /// bytes. The walk must be iterative (no native recursion), bounded in
+    /// depth, and bounded in output — the gadget below produces a leaf per
+    /// level and would previously have recursed ~input-size deep.
+    #[test]
+    fn domain_set_traversal_is_iterative_and_bounded() {
+        // labels[i] = 'a'; a linear chain of N levels: leaf bit set only at the
+        // last node, each node's bitmap entry is a single zero bit followed by
+        // its terminator. Depth = level count, not bounded by anything in the
+        // input except size — recursion would overflow a 2 MiB fetch-thread
+        // stack around ~10^5 levels.
+        let deep_chain = |levels: usize| {
+            let mut leaves = vec![0u64; levels / 64 + 1];
+            leaves[levels / 64] = 1 << (levels % 64);
+            // Level k occupies bit position 2k (label edge), 2k+1 is the
+            // terminator marking the end of the node's children.
+            let mut bitmap = vec![0u64; (2 * levels + 1) / 64 + 1];
+            for level in 0..=levels {
+                let pos = 2 * level + 1;
+                bitmap[pos / 64] |= 1 << (pos % 64);
+            }
+            let labels = vec![b'a'; levels];
+            encode_domain_set_raw(&leaves, &bitmap, &labels)
+        };
+        // Just under the depth cap: one leaf, the deepest.
+        let parsed = parse_upstream_ruleset_mrs(&encode_upstream_mrs(
+            TYPE_DOMAIN,
+            1,
+            &deep_chain(MAX_DOMAIN_SET_DEPTH - 100),
+        ))
+        .unwrap_or_else(|e| panic!("iterative traversal must not overflow: {e}"));
+        assert_eq!(parsed.entries.len(), 1);
+        // Past the cap the walk is an error, not a stack overflow or a
+        // multi-GiB frame allocation.
+        match parse_upstream_ruleset_mrs(&encode_upstream_mrs(
+            TYPE_DOMAIN,
+            1,
+            &deep_chain(MAX_DOMAIN_SET_DEPTH + 100),
+        ))
+        .map(|_| ())
+        {
+            Err(MrsError::InvalidLength("domain_set_depth", _)) => {}
+            other => panic!("expected InvalidLength(domain_set_depth), got {other:?}"),
+        }
+    }
+
+    /// The same traversal must stop rather than amplify input bytes into
+    /// unbounded output: a bitmap of all-zero edges makes every level a leaf.
+    #[test]
+    fn domain_set_output_is_bounded() {
+        // Node 0 has N children, each a leaf: node 0's bitmap run is N zero
+        // bits then a terminator; child i is node i+1 (count_zeros gives the
+        // running zero count) with its own bitmap segment holding an edge
+        // attempt that dies on an out-of-range label, then a terminator.
+        let n = 1_000_000usize;
+        let total_bits = n + 1 + 3 * n + 1;
+        let mut bitmap = vec![0u64; total_bits / 64 + 1];
+        let set = |b: &mut Vec<u64>, pos: usize| b[pos / 64] |= 1 << (pos % 64);
+        set(&mut bitmap, n); // node 0 terminator
+        let mut leaves = vec![0u64; n + 2];
+        // child i is node i+1; make every child a leaf
+        for i in 0..n {
+            let node = i + 1;
+            leaves[node / 64] |= 1 << (node % 64);
+            // child node's bitmap: terminator immediately
+            set(&mut bitmap, n + 1 + 3 * i + 1);
+        }
+        let labels = vec![b'x'; n];
+        let body = encode_domain_set_raw(&leaves, &bitmap, &labels);
+        let parsed = parse_upstream_ruleset_mrs(&encode_upstream_mrs(TYPE_DOMAIN, n, &body))
+            .unwrap_or_else(|e| panic!("shallow fan within bounds must parse: {e}"));
+        assert_eq!(parsed.entries.len(), n);
+    }
+
+    /// A mostly-ones bitmap makes `DomainSetIndex` allocate one `usize` per
+    /// set bit — ~64x input amplification. A well-formed trie has one
+    /// terminator per node and one incoming label edge per non-root node, so
+    /// #ones <= labels + 1 is rejected before the index is built.
+    #[test]
+    fn domain_set_terminators_are_bounded_by_labels() {
+        let body = encode_domain_set_raw(&[0u64], &[u64::MAX; 8], b"x");
+        match parse_upstream_domain_set(&body) {
+            Err(MrsError::InvalidLength("domain_set_terminators", _)) => {}
+            other => panic!("expected InvalidLength(domain_set_terminators), got {other:?}"),
+        }
+    }
+
+    /// The output and depth caps must actually fire: encode a small real trie
+    /// and drive `traverse_bounded` with tiny limits.
+    #[test]
+    fn domain_set_bounds_error_instead_of_amplifying() {
+        let body = encode_domain_set(&["a.example.com", "b.example.com", "c.example.com"]);
+        let mut r = ByteReader::new(&body);
+        assert_eq!(r.read_u8("v").unwrap(), 1);
+        let leaves = read_u64_vec(&mut r, "leaves").unwrap();
+        let label_bitmap = read_u64_vec(&mut r, "bitmap").unwrap();
+        let labels_len = r.read_i64_be("labels_len").unwrap() as usize;
+        let labels = r.read_slice("labels", labels_len).unwrap();
+        let traversal = DomainSetTraversal {
+            leaves: &leaves,
+            label_bitmap: &label_bitmap,
+            label_index: DomainSetIndex::new(&label_bitmap),
+            labels,
+        };
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Three domains in the set; cap at two.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, 2, usize::MAX, 4096)
+                .is_err(),
+            "entry cap must error"
+        );
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Depth 1 refuses every descent.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, usize::MAX, 1)
+                .is_err(),
+            "depth cap must error"
+        );
+        let (mut out, mut current) = (Vec::new(), Vec::new());
+        // Byte cap: each emitted domain is longer than 1 byte.
+        assert!(
+            traversal
+                .traverse_bounded(0, 0, &mut current, &mut out, usize::MAX, 1, 4096)
+                .is_err(),
+            "byte cap must error"
+        );
     }
 }
