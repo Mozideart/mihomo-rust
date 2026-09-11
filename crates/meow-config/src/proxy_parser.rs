@@ -103,6 +103,50 @@ pub fn parse_proxy(
     parse_proxy_with_dialer(config, &dialer, ipv6)
 }
 
+/// Whether `config` describes an `ss` node whose `plugin:` names an external
+/// SIP003 executable — i.e. one that would reach `Command::new` during
+/// adapter construction. Gates untrusted node sources (proxy-providers,
+/// subscriptions) before the trusted local path (issue #513).
+pub fn node_selects_external_plugin(config: &HashMap<String, serde_yaml::Value>) -> bool {
+    #[cfg(feature = "ss")]
+    {
+        config.get("type").and_then(|v| v.as_str()) == Some("ss")
+            && is_external_sip003_plugin(config.get("plugin").and_then(|v| v.as_str()))
+    }
+    #[cfg(not(feature = "ss"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
+/// [`parse_proxy`] for remote-controlled input (proxy-provider payloads).
+///
+/// Without `allow_external_plugin`, an `ss` node whose `plugin:` names an
+/// external SIP003 executable is rejected: that name reaches `Command::new`
+/// during adapter construction, so provider content would select a local
+/// binary (issue #513). Built-in/in-process plugins (`obfs`,
+/// `simple-obfs`, `v2ray-plugin`, `ech-tls-tunnel`) stay allowed — mihomo
+/// implements those in-process too, so gating them would diverge.
+pub fn parse_proxy_provider_node(
+    config: &HashMap<String, serde_yaml::Value>,
+    ipv6: bool,
+    allow_external_plugin: bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    if !allow_external_plugin && node_selects_external_plugin(config) {
+        let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
+        return Err(format!(
+            "ss[{name}]: external SIP003 plugin '{plugin}' is not allowed on \
+             provider-sourced nodes — it spawns a local executable selected by \
+             remote content (issue #513); set the provider's \
+             `allow-external-plugin: true` to opt in"
+        ));
+    }
+    let _ = allow_external_plugin;
+    parse_proxy(config, ipv6)
+}
+
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
 /// into every adapter. Used by apply_dialer_proxies to inject a
 /// [meow_proxy::dialer::ProxyDialer] so that dialer-proxy chaining works
@@ -3282,6 +3326,7 @@ tls: true
             exclude_type: None,
             health_check: None,
             header: None,
+            allow_external_plugin: None,
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider =
@@ -3523,5 +3568,98 @@ tls: true
             "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: s\nobfs-opts:\n  mode: http\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    // ─── issue #513: provider nodes cannot select a local executable ─────────
+
+    #[cfg(feature = "ss")]
+    fn external_plugin_ss() -> HashMap<String, serde_yaml::Value> {
+        proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: evil-plugin-from-provider\n",
+        )
+    }
+
+    /// Default: the provider path rejects external SIP003 plugins before the
+    /// adapter can reach `Command::new`. The local `proxies:` path is trusted
+    /// and unaffected.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_rejects_external_plugin_by_default() {
+        let cfg = external_plugin_ss();
+        let Err(err) = super::parse_proxy_provider_node(&cfg, true, false) else {
+            panic!("external plugin must be rejected without the opt-in")
+        };
+        assert!(err.contains("allow-external-plugin"), "msg: {err}");
+
+        // With the opt-in the gate opens: parse proceeds and fails at the
+        // *plugin spawn* boundary (the binary does not exist), proving the
+        // gate — not the plugin dispatch — did the rejecting above.
+        let Err(err) = super::parse_proxy_provider_node(&cfg, true, true) else {
+            panic!("with opt-in, parse must reach adapter construction")
+        };
+        assert!(err.contains("failed to start ss plugin"), "msg: {err}");
+    }
+
+    /// Built-in in-process plugins and non-ss nodes are untouched by the gate.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_allows_builtin_plugins_and_other_types() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: obfs\nplugin-opts:\n  mode: http\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+
+        // A stray `plugin:` on a trojan node is ignored by its parser —
+        // the gate must not reject it either.
+        let cfg = proxy_config(
+            "name: t\ntype: trojan\nserver: 1.2.3.4\nport: 443\npassword: p\nplugin: whatever\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
+    /// v2ray-plugin is a built-in in-process plugin — the gate must let it
+    /// through on provider nodes too.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn provider_node_allows_v2ray_plugin() {
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: v2ray-plugin\n",
+        );
+        assert!(super::parse_proxy_provider_node(&cfg, true, false).is_ok());
+    }
+
+    /// The provider opt-in key is `allow-external-plugin` (kebab-case like
+    /// the rest of `RawProxyProvider`) — a rename regression would leave the
+    /// gate permanently closed for users who set it.
+    #[test]
+    fn provider_allow_external_plugin_uses_kebab_case() {
+        let raw: crate::raw::RawProxyProvider =
+            serde_yaml::from_str("type: file\npath: p.yaml\nallow-external-plugin: true\n")
+                .unwrap();
+        assert_eq!(raw.allow_external_plugin, Some(true));
+    }
+
+    /// Subscriptions land remote nodes in the trusted `proxies:` list —
+    /// `parse_subscription_yaml` must drop external-SIP003 nodes before they
+    /// reach `Command::new`, while keeping built-in plugins.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn subscription_drops_external_plugin_nodes() {
+        let text = "proxies:\n\
+             - name: evil\n  type: ss\n  server: 1.2.3.4\n  port: 8388\n  \
+             password: p\n  cipher: aes-128-gcm\n  plugin: evil-plugin\n\
+             - name: ok\n  type: ss\n  server: 1.2.3.4\n  port: 8389\n  \
+             password: p\n  cipher: aes-128-gcm\n  plugin: v2ray-plugin\n\
+             - name: plain\n  type: trojan\n  server: 1.2.3.4\n  port: 443\n  password: p\n";
+        let data = crate::subscription::parse_subscription_yaml(text).unwrap();
+        let names: Vec<&str> = data
+            .proxies
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, ["ok", "plain"], "dropped: {names:?}");
     }
 }

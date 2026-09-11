@@ -20,6 +20,7 @@ use std::net::IpAddr;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Below this size, trie probing costs more than it saves for common configs
 /// with early matches. Compile small configs to straight-line ordered IR scan.
@@ -270,6 +271,21 @@ fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }
 
+/// Log a skipped match: the rule matched but its target is absent from the
+/// registry or unusable for this traffic (issue #513; mihomo's match loop
+/// also `continue`s a target without UDP support on UDP flows).
+/// Interpolated into the message itself because the /logs broadcast
+/// forwards only the `message` field.
+fn warn_missing_target(m: &CompiledMatchResult<'_>) {
+    warn!(
+        "rule {} matched target '{}' which is unavailable for this \
+         connection (absent from the registry, or no UDP support); \
+         skipping it",
+        m.rule_type.as_str(),
+        m.adapter_name,
+    );
+}
+
 /// One borrowed result from a compiled rule-set match.
 pub struct CompiledMatchResult<'a> {
     pub adapter_name: &'a str,
@@ -299,10 +315,19 @@ impl CompiledRuleSet {
         let mut adapter_lookup = HashMap::new();
         let mut needs_ip_resolution = false;
         let mut needs_process_lookup = false;
-        let mut seen_ops: HashSet<(RuleType, bool, bool, String)> = HashSet::new();
+        // Under continue-on-missing-target semantics (issue #513), an
+        // earlier rule no longer terminates the scan when its target is
+        // absent — so the passes below may only prune a rule whose outcome
+        // is *provably identical* to the covering rule's: same predicate
+        // space AND same adapter (a dead covering target is skipped, then
+        // the covered rule resolves — possibly to a different adapter).
+        // `adapter_index` therefore feeds every prune key. Registry
+        // liveness is runtime state (`update_proxies` can swap the map
+        // without a rebuild), so it cannot be consulted here.
+        let mut seen_ops: HashSet<(RuleType, bool, bool, String, usize)> = HashSet::new();
         let mut shadow_oracle = ShadowOracle::default();
-        let mut dst_coverage = CidrCoverage::new();
-        let mut src_coverage = CidrCoverage::new();
+        let mut dst_coverage: HashMap<usize, CidrCoverage> = HashMap::new();
+        let mut src_coverage: HashMap<usize, CidrCoverage> = HashMap::new();
         let mut seen_ip_demand = false;
         let mut pruned_never_match = 0usize;
         let mut pruned_duplicates = 0usize;
@@ -343,18 +368,32 @@ impl CompiledRuleSet {
                 Folded::Op(op) => op,
             };
 
+            // Intern the adapter early: every prune decision below needs the
+            // rule's target identity (see the pass-invariant comment above).
+            let adapter_name = SmolStr::from(rule.adapter());
+            let adapter_index =
+                intern_adapter(&mut adapter_names, &mut adapter_lookup, adapter_name);
+
             // Duplicate elimination on canonical predicate fingerprints: a
-            // later rule with an identical predicate can never win under
-            // first-match-wins — regardless of its adapter. Ops without a
-            // cheap canonical identity are never deduplicated. The key
-            // includes the rule's enrichment demands: an identical predicate
-            // carrying a *stronger* demand (a resolving IP-CIDR after a
-            // no-resolve twin) must stay live as the demand-stop carrier for
-            // the lazy scan — pruning it would silently skip a DNS
-            // resolution whose result earlier rules observe on the strict
-            // re-run.
+            // later rule with an identical predicate AND adapter can never
+            // change the outcome — either both resolve or both are skipped
+            // (issue #513 continue semantics: the adapter is part of the
+            // key because a dead first target falls through to the twin).
+            // Ops without a cheap canonical identity are never
+            // deduplicated. The key includes the rule's enrichment demands:
+            // an identical predicate carrying a *stronger* demand (a
+            // resolving IP-CIDR after a no-resolve twin) must stay live as
+            // the demand-stop carrier for the lazy scan — pruning it would
+            // silently skip a DNS resolution whose result earlier rules
+            // observe on the strict re-run.
             if let Some(fingerprint) = dedup_fingerprint(payload, &op) {
-                if !seen_ops.insert((rule_type, demands_ip, demands_process, fingerprint)) {
+                if !seen_ops.insert((
+                    rule_type,
+                    demands_ip,
+                    demands_process,
+                    fingerprint,
+                    adapter_index,
+                )) {
                     pruned_duplicates += 1;
                     continue;
                 }
@@ -362,39 +401,42 @@ impl CompiledRuleSet {
 
             // Shadowed-rule elimination: a domain-family predicate whose
             // match set is fully covered by earlier suffix / keyword /
-            // star-wildcard rules can never fire either, for the same
-            // first-match-wins reason.
-            if shadow_oracle.shadows(&op, payload) {
+            // star-wildcard rules with the SAME adapter can never change the
+            // outcome — the covering rule resolves to the identical target,
+            // live or skipped alike.
+            if shadow_oracle.shadows(&op, payload, adapter_index) {
                 pruned_shadowed += 1;
                 continue;
             }
-            shadow_oracle.absorb(&op, payload);
+            shadow_oracle.absorb(&op, payload, adapter_index);
 
-            // Covered-CIDR elimination: the IP analogue of shadowing. A
-            // network contained in the union of earlier same-axis networks
-            // can never fire. The demand guard mirrors the dedup rule: if
-            // this rule is the first to demand resolution, it must stay
-            // live as the demand-stop carrier even though it can never win.
+            // Covered-CIDR elimination: the IP analogue of shadowing, again
+            // per adapter. The demand guard mirrors the dedup rule: if this
+            // rule is the first to demand resolution, it must stay live as
+            // the demand-stop carrier even though it can never win.
             if let RuleOp::IpCidr { net, src } = &op {
-                let coverage = if *src {
+                let coverages = if *src {
                     &mut src_coverage
                 } else {
                     &mut dst_coverage
                 };
-                if coverage.covers(*net) && (!demands_ip || seen_ip_demand) {
+                let covered = coverages
+                    .get(&adapter_index)
+                    .is_some_and(|c| c.covers(*net));
+                if covered && (!demands_ip || seen_ip_demand) {
                     pruned_covered += 1;
                     continue;
                 }
-                coverage.absorb(*net);
+                coverages
+                    .entry(adapter_index)
+                    .or_insert_with(CidrCoverage::new)
+                    .absorb(*net);
             }
 
             needs_ip_resolution |= demands_ip;
             needs_process_lookup |= demands_process;
             seen_ip_demand |= demands_ip;
 
-            let adapter_name = SmolStr::from(rule.adapter());
-            let adapter_index =
-                intern_adapter(&mut adapter_names, &mut adapter_lookup, adapter_name);
             let terminator = matches!(op, RuleOp::Match);
 
             slots.push(CompiledRuleSlot {
@@ -409,9 +451,13 @@ impl CompiledRuleSet {
             });
 
             // Dead-rule elimination: an unconditional MATCH/FINAL ends the
-            // reachable prefix. (`RuleType::Match` always lowers to a static
-            // adapter, so the terminator is genuinely unconditional.)
-            if terminator {
+            // reachable prefix — but only when its target is *guaranteed*
+            // resolvable. The match-time predicate treats "DIRECT" as
+            // always present (the tunnel owns the adapter), so
+            // `MATCH,DIRECT` is a true terminator; any other target can be
+            // skipped at match time, leaving the tail reachable
+            // (issue #513).
+            if terminator && rule.adapter() == "DIRECT" {
                 break;
             }
         }
@@ -467,10 +513,16 @@ impl CompiledRuleSet {
     /// `rules` must be the same rule slice this plan was built from. The plan
     /// stores rule indices rather than references so it can live beside an
     /// owned `Vec<Box<dyn Rule>>` in a route-table snapshot.
+    ///
+    /// `target_exists` reports whether a matched rule's target names a live
+    /// registry entry (DIRECT/REJECT/GLOBAL included). A match on a missing
+    /// target is skipped and the scan continues — mihomo's `match()` does
+    /// `continue` on `proxies[adapter] == nil` (issue #513).
     pub fn match_rules<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> Option<CompiledMatchResult<'a>> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -481,7 +533,15 @@ impl CompiledRuleSet {
         let helper = RuleMatchHelper;
         let input = MatchInput::new(metadata);
         if self.execution_plan == ExecutionPlan::LinearScan {
-            return self.scan_range(0..self.slots.len(), &input, rules, &helper);
+            // EVAL_TRIE is inert under LinearScan (no trie, hence no owned
+            // slots) — `true` keeps the scan correct if one ever appears.
+            return self.scan_range::<true>(
+                0..self.slots.len(),
+                &input,
+                rules,
+                &helper,
+                target_exists,
+            );
         }
 
         let trie_hit = if input.host.is_empty() {
@@ -510,15 +570,35 @@ impl CompiledRuleSet {
             None => (self.slots.len(), None),
         };
 
-        if let Some(matched) = self.scan_range(0..scan_end, &input, rules, &helper) {
+        // Prefix scan: EVAL_TRIE=false — the trie proved no owned slot
+        // before `scan_end` matches this host.
+        if let Some(matched) =
+            self.scan_range::<false>(0..scan_end, &input, rules, &helper, target_exists)
+        {
             return Some(matched);
         }
 
+        // Upstream `continue` semantics: a matched trie hit with a missing
+        // target is skipped and the scan resumes at the slot *after* it —
+        // with EVAL_TRIE=true, because a second matching domain rule (also
+        // trie-owned) may live in the tail and must be evaluated directly.
+        let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            return Some(self.static_match(slot));
+            let m = self.static_match(slot);
+            if target_exists(m.adapter_name) {
+                return Some(m);
+            }
+            warn_missing_target(&m);
+            tail_start += 1;
         }
 
-        self.scan_range(scan_end..self.slots.len(), &input, rules, &helper)
+        self.scan_range::<true>(
+            tail_start..self.slots.len(),
+            &input,
+            rules,
+            &helper,
+            target_exists,
+        )
     }
 
     /// Like [`Self::match_rules`], but with **demand-driven early stop**:
@@ -531,10 +611,13 @@ impl CompiledRuleSet {
     /// pre-resolution or a process-table walk. On
     /// [`LazyMatchOutcome::NeedsEnrichment`], materialize the reported
     /// fields and re-run [`Self::match_rules`] with the enriched metadata.
+    /// Same `target_exists` contract as [`Self::match_rules`]: matched slots
+    /// whose target is absent are skipped and the scan continues.
     pub fn match_rules_lazy<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> LazyMatchOutcome<'a> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -545,7 +628,13 @@ impl CompiledRuleSet {
         let helper = RuleMatchHelper;
         let input = MatchInput::new(metadata);
         if self.execution_plan == ExecutionPlan::LinearScan {
-            return match self.scan_range_ctl::<true>(0..self.slots.len(), &input, rules, &helper) {
+            return match self.scan_range_ctl::<true, true>(
+                0..self.slots.len(),
+                &input,
+                rules,
+                &helper,
+                target_exists,
+            ) {
                 ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
                 ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
                 ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
@@ -569,7 +658,8 @@ impl CompiledRuleSet {
             None => (self.slots.len(), None),
         };
 
-        match self.scan_range_ctl::<true>(0..scan_end, &input, rules, &helper) {
+        match self.scan_range_ctl::<true, false>(0..scan_end, &input, rules, &helper, target_exists)
+        {
             ScanOutcome::Matched(matched) => return LazyMatchOutcome::Matched(matched),
             // A blocked slot before the trie hit may match and beat it, so
             // enrichment is needed even though a domain rule stands ready.
@@ -577,11 +667,23 @@ impl CompiledRuleSet {
             ScanOutcome::Exhausted => {}
         }
 
+        let mut tail_start = scan_end;
         if let Some(slot) = hit_slot {
-            return LazyMatchOutcome::Matched(self.static_match(slot));
+            let m = self.static_match(slot);
+            if target_exists(m.adapter_name) {
+                return LazyMatchOutcome::Matched(m);
+            }
+            warn_missing_target(&m);
+            tail_start += 1;
         }
 
-        match self.scan_range_ctl::<true>(scan_end..self.slots.len(), &input, rules, &helper) {
+        match self.scan_range_ctl::<true, true>(
+            tail_start..self.slots.len(),
+            &input,
+            rules,
+            &helper,
+            target_exists,
+        ) {
             ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
             ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
             ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
@@ -646,14 +748,15 @@ impl CompiledRuleSet {
         self.execution_plan == ExecutionPlan::LinearScan
     }
 
-    fn scan_range<'a>(
+    fn scan_range<'a, const EVAL_TRIE: bool>(
         &'a self,
         range: Range<usize>,
         input: &MatchInput<'_>,
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> Option<CompiledMatchResult<'a>> {
-        match self.scan_range_ctl::<false>(range, input, rules, helper) {
+        match self.scan_range_ctl::<false, EVAL_TRIE>(range, input, rules, helper, target_exists) {
             ScanOutcome::Matched(matched) => Some(matched),
             ScanOutcome::Blocked { .. } | ScanOutcome::Exhausted => None,
         }
@@ -662,13 +765,22 @@ impl CompiledRuleSet {
     /// `STOP_ON_DEMAND` is a const generic so the strict scan monomorphizes
     /// to the original tight loop — no per-slot demand branch, no position
     /// bookkeeping (measured: the runtime-bool version cost ~2.5x on a 10k
-    /// wildcard-rule miss scan).
-    fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool>(
+    /// wildcard-rule miss scan). `EVAL_TRIE` is likewise const: `false` only
+    /// for the indexed plan's pre-hit prefix scan (the trie already proved
+    /// those owned slots cannot match); `true` everywhere else, including
+    /// post-skip tail scans where a second matching domain rule may live.
+    ///
+    /// A matched slot whose target is absent from the registry is warned and
+    /// skipped (`continue`), matching mihomo's `match()` loop — one hash
+    /// lookup per *matching* slot only, so the miss-scan hot path is
+    /// unchanged (issue #513).
+    fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool, const EVAL_TRIE: bool>(
         &'a self,
         range: Range<usize>,
         input: &MatchInput<'_>,
         rules: &'a [Box<dyn Rule>],
         helper: &RuleMatchHelper,
+        target_exists: &dyn Fn(&str) -> bool,
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
@@ -677,39 +789,46 @@ impl CompiledRuleSet {
                     pos: start + offset,
                 };
             }
-            match &slot.op {
-                // Owned by the domain index: the trie already proved this
-                // slot does not match anywhere a scan range is consulted.
-                RuleOp::TrieOwned => {}
+            let matched = match &slot.op {
+                // Owned by the domain index. Prefix scans skip it — the
+                // trie's min-index proof covers every owned slot consulted
+                // there. Post-skip tail scans (EVAL_TRIE) must evaluate the
+                // underlying rule directly: a *later* owned domain rule can
+                // still match even though an earlier hit was skipped for a
+                // dead target (issue #513 continue semantics).
+                RuleOp::TrieOwned => {
+                    if EVAL_TRIE {
+                        rules.get(slot.rule_index).and_then(|rule| {
+                            rule.match_metadata(input.metadata, helper)
+                                .then(|| self.static_match(slot))
+                        })
+                    } else {
+                        None
+                    }
+                }
                 RuleOp::Fallback => {
                     let Some(rule) = rules.get(slot.rule_index) else {
                         return ScanOutcome::Exhausted;
                     };
                     match slot.target_plan {
-                        TargetPlan::StaticAdapter => {
-                            if rule.match_metadata(input.metadata, helper) {
-                                return ScanOutcome::Matched(self.static_match(slot));
-                            }
-                        }
-                        TargetPlan::DynamicAdapter => {
-                            if let Some(adapter_name) =
-                                rule.match_and_resolve(input.metadata, helper)
-                            {
+                        TargetPlan::StaticAdapter => rule
+                            .match_metadata(input.metadata, helper)
+                            .then(|| self.static_match(slot)),
+                        TargetPlan::DynamicAdapter => rule
+                            .match_and_resolve(input.metadata, helper)
+                            .map(|adapter_name| {
                                 let adapter_index = self.adapter_lookup.get(adapter_name).copied();
-                                return ScanOutcome::Matched(self.make_match(
-                                    slot,
-                                    adapter_name,
-                                    adapter_index,
-                                ));
-                            }
-                        }
+                                self.make_match(slot, adapter_name, adapter_index)
+                            }),
                     }
                 }
-                op => {
-                    if matches_op(op, input, helper) {
-                        return ScanOutcome::Matched(self.static_match(slot));
-                    }
+                op => matches_op(op, input, helper).then(|| self.static_match(slot)),
+            };
+            if let Some(m) = matched {
+                if target_exists(m.adapter_name) {
+                    return ScanOutcome::Matched(m);
                 }
+                warn_missing_target(&m);
             }
         }
         ScanOutcome::Exhausted
@@ -903,64 +1022,72 @@ fn port_fingerprint(matcher: &PortMatcher) -> String {
 /// even for degenerate or non-ASCII payloads.
 #[derive(Default)]
 struct ShadowOracle {
-    /// Lowered DOMAIN-SUFFIX payloads seen so far.
-    suffixes: HashSet<String>,
+    /// Lowered DOMAIN-SUFFIX payloads seen so far, keyed to the rule's
+    /// adapter: a cover only proves the shadowed rule dead when it shares
+    /// the covering rule's adapter (issue #513 continue semantics).
+    suffixes: HashMap<String, usize>,
     /// Lowered `rest` of star-shaped `*.rest` DOMAIN-WILDCARD payloads.
-    star_rests: HashSet<String>,
+    star_rests: HashMap<String, usize>,
     /// Lowered DOMAIN-KEYWORD payloads seen so far.
-    keywords: Vec<String>,
+    keywords: Vec<(String, usize)>,
 }
 
 impl ShadowOracle {
     /// Record a surviving rule's coverage. Empty payloads are excluded: an
     /// empty keyword matches every host and would need MATCH-terminator
     /// treatment, not subset reasoning.
-    fn absorb(&mut self, op: &RuleOp, payload: &str) {
+    fn absorb(&mut self, op: &RuleOp, payload: &str, adapter_index: usize) {
         match op {
             RuleOp::DomainSuffix(suffix) if !suffix.is_empty() => {
-                self.suffixes.insert(suffix.clone());
+                self.suffixes.insert(suffix.clone(), adapter_index);
             }
             RuleOp::DomainKeyword(keyword) if !keyword.is_empty() => {
-                self.keywords.push(keyword.clone());
+                self.keywords.push((keyword.clone(), adapter_index));
             }
             RuleOp::DomainWildcard(_) => {
                 if let Some(rest) = star_rest(payload) {
-                    self.star_rests.insert(rest);
+                    self.star_rests.insert(rest, adapter_index);
                 }
             }
             _ => {}
         }
     }
 
-    /// True iff earlier rules cover every host this predicate matches.
-    fn shadows(&self, op: &RuleOp, payload: &str) -> bool {
+    /// True iff earlier rules WITH THIS ADAPTER cover every host this
+    /// predicate matches — the only cover that is dead under
+    /// continue-on-missing-target.
+    fn shadows(&self, op: &RuleOp, payload: &str, adapter_index: usize) -> bool {
         match op {
             RuleOp::Domain(domain) => {
-                self.suffix_covers(domain)
-                    || self.keyword_covers(domain)
-                    || self.star_covers(domain)
+                self.suffix_covers(domain, adapter_index)
+                    || self.keyword_covers(domain, adapter_index)
+                    || self.star_covers(domain, adapter_index)
             }
             RuleOp::DomainSuffix(suffix) => {
-                self.suffix_covers(suffix) || self.keyword_covers(suffix)
+                self.suffix_covers(suffix, adapter_index)
+                    || self.keyword_covers(suffix, adapter_index)
             }
-            RuleOp::DomainKeyword(keyword) => self.keyword_covers(keyword),
+            RuleOp::DomainKeyword(keyword) => self.keyword_covers(keyword, adapter_index),
             // Only the star shape has an exact host-set description; every
             // other wildcard shape stays conservatively unpruned.
-            RuleOp::DomainWildcard(_) => star_rest(payload)
-                .is_some_and(|rest| self.suffix_covers(&rest) || self.keyword_covers(&rest)),
+            RuleOp::DomainWildcard(_) => star_rest(payload).is_some_and(|rest| {
+                self.suffix_covers(&rest, adapter_index)
+                    || self.keyword_covers(&rest, adapter_index)
+            }),
             _ => false,
         }
     }
 
-    /// Some earlier DOMAIN-SUFFIX matches every host `pattern` can match:
-    /// an entry equals `pattern` or is a dot-boundary suffix of it.
-    fn suffix_covers(&self, pattern: &str) -> bool {
+    /// Some earlier DOMAIN-SUFFIX (with this adapter) matches every host
+    /// `pattern` can match: an entry equals `pattern` or is a dot-boundary
+    /// suffix of it.
+    fn suffix_covers(&self, pattern: &str, adapter_index: usize) -> bool {
         if self.suffixes.is_empty() {
             return false;
         }
         let mut start = 0;
         loop {
-            if self.suffixes.contains(&pattern[start..]) {
+            if self.suffixes.get(&pattern[start..]) == Some(&adapter_index) {
                 return true;
             }
             match pattern[start..].find('.') {
@@ -970,24 +1097,24 @@ impl ShadowOracle {
         }
     }
 
-    /// Some earlier DOMAIN-KEYWORD is a substring of `pattern`: every host
-    /// containing `pattern` (or equal to it, or ending with it) contains
-    /// the keyword too.
-    fn keyword_covers(&self, pattern: &str) -> bool {
+    /// Some earlier DOMAIN-KEYWORD (with this adapter) is a substring of
+    /// `pattern`: every host containing `pattern` (or equal to it, or
+    /// ending with it) contains the keyword too.
+    fn keyword_covers(&self, pattern: &str, adapter_index: usize) -> bool {
         self.keywords
             .iter()
-            .any(|keyword| pattern.contains(keyword.as_str()))
+            .any(|(keyword, a)| *a == adapter_index && pattern.contains(keyword.as_str()))
     }
 
-    /// Some earlier star wildcard `*.rest` matches exactly the host
-    /// `domain`: it splits as `<one non-empty label>.rest`.
-    fn star_covers(&self, domain: &str) -> bool {
+    /// Some earlier star wildcard `*.rest` (with this adapter) matches
+    /// exactly the host `domain`: it splits as `<one non-empty label>.rest`.
+    fn star_covers(&self, domain: &str, adapter_index: usize) -> bool {
         if self.star_rests.is_empty() {
             return false;
         }
-        domain
-            .split_once('.')
-            .is_some_and(|(label, rest)| !label.is_empty() && self.star_rests.contains(rest))
+        domain.split_once('.').is_some_and(|(label, rest)| {
+            !label.is_empty() && self.star_rests.get(rest) == Some(&adapter_index)
+        })
     }
 }
 
@@ -1797,7 +1924,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1819,7 +1948,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(
             result.adapter_name, "Broad",
             "min-index trie semantics: earliest matching domain rule wins",
@@ -1841,7 +1972,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit_443, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit_443, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "PortFirst");
 
         let hit_80 = Metadata {
@@ -1849,7 +1982,9 @@ mod tests {
             dst_port: 80,
             ..Default::default()
         };
-        let result = set.match_rules(&hit_80, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit_80, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "P9");
     }
 
@@ -1887,7 +2022,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1922,7 +2059,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "host={host}");
         }
     }
@@ -1933,16 +2072,22 @@ mod tests {
             Box::new(DomainSuffixRule::new("example.com", "Suffix")),
             Box::new(DomainKeywordRule::new("tracker", "Keyword")),
             Box::new(DomainWildcardRule::new("*.cdn.net", "Star").unwrap()),
-            // Shadowed — every host each of these matches is claimed earlier:
-            Box::new(DomainRule::new("www.example.com", "S1")), // under suffix
-            Box::new(DomainRule::new("EXAMPLE.COM", "S2")),     // suffix apex, case-folded
-            Box::new(DomainSuffixRule::new("api.example.com", "S3")), // nested suffix
-            Box::new(DomainWildcardRule::new("*.example.com", "S4").unwrap()), // star ⊂ suffix
-            Box::new(DomainRule::new("mytracker.io", "S5")),    // contains keyword
-            Box::new(DomainSuffixRule::new("tracker.org", "S6")), // contains keyword
-            Box::new(DomainKeywordRule::new("supertrackers", "S7")), // contains keyword
-            Box::new(DomainWildcardRule::new("*.trackers.net", "S8").unwrap()), // rest ⊇ keyword
-            Box::new(DomainRule::new("edge.cdn.net", "S9")),    // one label under star
+            // Shadowed — every host each of these matches is claimed earlier
+            // by a rule with the SAME adapter (issue #513: a different
+            // adapter would stay live — a dead covering target falls
+            // through to the covered rule):
+            Box::new(DomainRule::new("www.example.com", "Suffix")), // under suffix
+            Box::new(DomainRule::new("EXAMPLE.COM", "Suffix")),     // suffix apex, case-folded
+            Box::new(DomainSuffixRule::new("api.example.com", "Suffix")), // nested suffix
+            Box::new(DomainWildcardRule::new("*.example.com", "Suffix").unwrap()), // star ⊂ suffix
+            Box::new(DomainRule::new("mytracker.io", "Keyword")),   // contains keyword
+            Box::new(DomainSuffixRule::new("tracker.org", "Keyword")), // contains keyword
+            Box::new(DomainKeywordRule::new("supertrackers", "Keyword")), // contains keyword
+            Box::new(DomainWildcardRule::new("*.trackers.net", "Keyword").unwrap()), // rest ⊇ keyword
+            Box::new(DomainRule::new("edge.cdn.net", "Star")), // one label under star
+            // Covered by the suffix but with a DIFFERENT adapter — stays
+            // live under continue semantics:
+            Box::new(DomainRule::new("diff.example.com", "DiffAdapter")),
             // Not shadowed — must stay live:
             Box::new(DomainRule::new("a.b.cdn.net", "LiveTwoLabels")), // star = one label only
             Box::new(DomainRule::new("cdn.net", "LiveApex")),          // star needs a label
@@ -1958,8 +2103,8 @@ mod tests {
             .collect();
         assert_eq!(
             live,
-            vec![0, 1, 2, 12, 13, 14, 15],
-            "exactly the shadowed rules must be pruned",
+            vec![0, 1, 2, 12, 13, 14, 15, 16],
+            "same-adapter shadows prune; the different-adapter twin survives",
         );
 
         // Pruning must be observation-equivalent to the naive reference.
@@ -1973,6 +2118,7 @@ mod tests {
             "www.supertrackers.dev",
             "x.trackers.net",
             "edge.cdn.net",
+            "diff.example.com",
             "a.b.cdn.net",
             "cdn.net",
             "examples.com",
@@ -1983,21 +2129,39 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let compiled = set.match_rules(&meta, &rules).expect("must match");
+            let compiled = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(compiled.adapter_name, adapter, "host={host}");
         }
+
+        // Dead covering target: the different-adapter twin is reached —
+        // pruning it would have leaked the host to DIRECT.
+        let meta = Metadata {
+            host: "diff.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|name| name != "Suffix")
+            .expect("twin must match after the covering rule is skipped");
+        assert_eq!(result.adapter_name, "DiffAdapter");
     }
 
     #[test]
     fn canonical_fingerprints_dedup_textual_variants() {
+        // Textual variants only dedup when they also share the adapter —
+        // under continue semantics a dead first target falls through to a
+        // twin with a different one (issue #513).
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("10.1.2.3/8", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.0.0.0/8", "B", false, true).unwrap()), // same network
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()), // same network
+            Box::new(IpCidrRule::new("10.0.0.0/8", "Other", false, true).unwrap()), // same net, diff adapter
             Box::new(PortRule::new("80,443", "C", false).unwrap()),
-            Box::new(PortRule::new("443, 80", "D", false).unwrap()), // same port set
+            Box::new(PortRule::new("443, 80", "C", false).unwrap()), // same port set
             Box::new(PortRule::new("70-90/85-100", "E", false).unwrap()),
-            Box::new(PortRule::new("70-100", "F", false).unwrap()), // merges to the same span
+            Box::new(PortRule::new("70-100", "E", false).unwrap()), // merges to the same span
             Box::new(FinalRule::new("DIRECT")),
         ];
 
@@ -2009,8 +2173,8 @@ mod tests {
             .collect();
         assert_eq!(
             live,
-            vec![0, 2, 4, 6],
-            "textual variants of one predicate must dedup onto the first",
+            vec![0, 2, 3, 5, 7],
+            "same-adapter textual variants dedup; different-adapter twins stay",
         );
 
         for (meta, expected) in [
@@ -2044,7 +2208,9 @@ mod tests {
                 "DIRECT",
             ),
         ] {
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected);
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter);
@@ -2053,15 +2219,22 @@ mod tests {
 
     #[test]
     fn covered_cidr_rules_are_pruned() {
+        // Coverage is tracked per adapter (issue #513): a covered rule
+        // prunes only when the covering networks carry the same adapter —
+        // otherwise a dead covering target would fall through to a rule the
+        // pass removed.
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("10.0.0.0/9", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.128.0.0/9", "B", false, true).unwrap()),
+            Box::new(IpCidrRule::new("10.128.0.0/9", "A", false, true).unwrap()),
             Box::new(IpCidrRule::new("2001:db8::/32", "C", false, true).unwrap()),
-            // Covered — contained in the union of earlier networks:
-            Box::new(IpCidrRule::new("10.64.0.0/10", "S1", false, true).unwrap()),
+            // Covered — contained in the union of earlier same-adapter nets:
+            Box::new(IpCidrRule::new("10.64.0.0/10", "A", false, true).unwrap()),
             // The two /9s merge to 10.0.0.0/8, so the whole /8 is covered.
-            Box::new(IpCidrRule::new("10.0.0.0/8", "S2", false, true).unwrap()),
-            Box::new(IpCidrRule::new("2001:db8:aa::/48", "S3", false, true).unwrap()),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
+            Box::new(IpCidrRule::new("2001:db8:aa::/48", "C", false, true).unwrap()),
+            // Same networks, different adapters — stay live:
+            Box::new(IpCidrRule::new("10.64.0.0/10", "DiffV4", false, true).unwrap()),
+            Box::new(IpCidrRule::new("2001:db8:bb::/48", "DiffV6", false, true).unwrap()),
             // Not covered — must stay live:
             Box::new(IpCidrRule::new("10.0.0.0/7", "LiveWider", false, true).unwrap()),
             Box::new(IpCidrRule::new("10.0.0.0/8", "LiveSrcAxis", true, true).unwrap()),
@@ -2076,13 +2249,13 @@ mod tests {
             .collect();
         assert_eq!(
             live,
-            vec![0, 1, 2, 6, 7, 8],
-            "exactly the union-covered networks must be pruned",
+            vec![0, 1, 2, 6, 7, 8, 9, 10],
+            "same-adapter union coverage prunes; different-adapter twins stay",
         );
 
         for (dst, src, expected) in [
             (Some("10.1.2.3"), None, "A"),
-            (Some("10.200.0.1"), None, "B"),
+            (Some("10.200.0.1"), None, "A"),
             (Some("2001:db8:aa::1"), None, "C"),
             (Some("11.0.0.1"), None, "LiveWider"),
             (Some("192.0.2.1"), Some("10.5.5.5"), "LiveSrcAxis"),
@@ -2094,7 +2267,9 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "dst={dst:?} src={src:?}");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter, "dst={dst:?} src={src:?}");
@@ -2106,9 +2281,12 @@ mod tests {
         // The covered /16 is the only rule demanding DNS resolution: pruning
         // it would silently disable the enrichment whose result the earlier
         // no-resolve /8 observes on the strict re-run.
+        // Same adapter as the covering rule — coverage is per-adapter
+        // (issue #513), so a different adapter would keep the rule live for
+        // an unrelated reason.
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.1.0.0/16", "B", false, false).unwrap()),
+            Box::new(IpCidrRule::new("10.1.0.0/16", "A", false, false).unwrap()),
             Box::new(FinalRule::new("DIRECT")),
         ];
         let set = CompiledRuleSet::build(&rules);
@@ -2122,7 +2300,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules),
+                set.match_rules_lazy(&meta, &rules, &|_| true),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "lazy scan must stop for resolution instead of falling through",
@@ -2132,7 +2310,7 @@ mod tests {
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("192.0.2.0/24", "R", false, false).unwrap()),
             Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.1.0.0/16", "B", false, false).unwrap()),
+            Box::new(IpCidrRule::new("10.1.0.0/16", "A", false, false).unwrap()),
             Box::new(FinalRule::new("DIRECT")),
         ];
         let set = CompiledRuleSet::build(&rules);
@@ -2146,20 +2324,23 @@ mod tests {
 
     #[test]
     fn dedup_keeps_stronger_demand_twins() {
-        // Identical predicate, stronger demand profile: must NOT dedup.
+        // Identical predicate + adapter, stronger demand profile: must NOT
+        // dedup — and the coverage pass must spare it too, since it is the
+        // sole demand carrier (issue #513 made coverage adapter-aware; the
+        // same adapter here isolates the demand guard).
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.0.0.0/8", "B", false, false).unwrap()),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, false).unwrap()),
             Box::new(FinalRule::new("DIRECT")),
         ];
         let set = CompiledRuleSet::build(&rules);
         assert_eq!(set.slots().len(), 3);
         assert!(set.needs_ip_resolution());
 
-        // Identical predicate, identical demands: dedups as before.
+        // Identical predicate, identical demands, same adapter: dedups.
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
-            Box::new(IpCidrRule::new("10.0.0.0/8", "B", false, true).unwrap()),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "A", false, true).unwrap()),
             Box::new(FinalRule::new("DIRECT")),
         ];
         let set = CompiledRuleSet::build(&rules);
@@ -2192,13 +2373,16 @@ mod tests {
                 ],
                 "OrPort",
             )),
-            // AND of constants folds to always → unconditional terminator:
+            // AND of constants folds to always → unconditional terminator —
+            // but only a predicate-guaranteed target ends the scan
+            // (issue #513): the tail is truncated because this rule targets
+            // DIRECT, which the match-time predicate treats as always live.
             Box::new(AndRule::new(
                 vec![
                     Box::new(FinalRule::new("X")),
                     Box::new(NotRule::new(never_rule(), "X")),
                 ],
-                "AlwaysAnd",
+                "DIRECT",
             )),
             // Dead: truncated by the folded terminator above.
             Box::new(FinalRule::new("DIRECT")),
@@ -2213,15 +2397,17 @@ mod tests {
         assert_eq!(
             live,
             vec![2, 3],
-            "never-folds prune, always-fold terminates"
+            "never-folds prune, always-fold on DIRECT terminates"
         );
 
-        for (port, expected) in [(8443, "OrPort"), (80, "AlwaysAnd")] {
+        for (port, expected) in [(8443, "OrPort"), (80, "DIRECT")] {
             let meta = Metadata {
                 dst_port: port,
                 ..Default::default()
             };
-            let result = set.match_rules(&meta, &rules).expect("must match");
+            let result = set
+                .match_rules(&meta, &rules, &|_| true)
+                .expect("must match");
             assert_eq!(result.adapter_name, expected, "port={port}");
             let (adapter, ..) = naive_match(&meta, &rules).expect("must match");
             assert_eq!(result.adapter_name, adapter, "port={port}");
@@ -2235,22 +2421,39 @@ mod tests {
         let rule_set: Arc<dyn RuleSet> = Arc::from(set_box);
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "A", true)),
-            // Same provider handle: the predicate is identical, so the later
-            // occurrence can never win and must dedup by pointer identity.
+            // Same provider handle AND adapter: the predicate is identical,
+            // so the later occurrence can never change the outcome and must
+            // dedup by pointer identity (issue #513: adapter is part of the
+            // dedup identity — a different adapter would stay live).
+            Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "A", true)),
+            // Same provider handle, DIFFERENT adapter: stays live — a dead
+            // first target falls through to this twin.
             Box::new(RuleSetRule::new("prov", Arc::clone(&rule_set), "B", true)),
             Box::new(FinalRule::new("DIRECT")),
         ];
 
         let set = CompiledRuleSet::build(&rules);
-        assert_eq!(set.slots().len(), 2, "duplicate RULE-SET must be pruned");
+        assert_eq!(
+            set.slots().len(),
+            3,
+            "same-adapter duplicate prunes; different-adapter twin stays",
+        );
 
         let meta = Metadata {
             host: "shared.example".into(),
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "A");
+
+        // Dead first target: the different-adapter twin is reached.
+        let result = set
+            .match_rules(&meta, &rules, &|name| name != "A")
+            .expect("must match");
+        assert_eq!(result.adapter_name, "B");
     }
 
     #[test]
@@ -2270,7 +2473,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "Umlaut");
     }
 
@@ -2394,7 +2599,7 @@ mod tests {
 
                 let expected = naive_match(&metadata, &rules);
                 let actual = set
-                    .match_rules(&metadata, &rules)
+                    .match_rules(&metadata, &rules, &|_| true)
                     .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
                 assert_eq!(
                     actual, expected,
@@ -2418,7 +2623,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -2444,7 +2649,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DomainProxy"),
             _ => panic!("domain match must complete without enrichment"),
         }
@@ -2464,7 +2669,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("must fall through to FINAL without demanding enrichment"),
         }
@@ -2485,7 +2690,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("no-resolve rule must not demand enrichment"),
         }
@@ -2508,7 +2713,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -2538,7 +2743,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules) {
+        match set.match_rules_lazy(&meta, &rules, &|_| true) {
             LazyMatchOutcome::NeedsEnrichment { needs_ip, .. } => assert!(needs_ip),
             _ => panic!("blocked slot before the trie hit must demand enrichment"),
         }
@@ -2551,7 +2756,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&resolved, &rules).expect("must match");
+        let result = set
+            .match_rules(&resolved, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "P7");
     }
 
@@ -2610,7 +2817,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "GeoProxy");
         assert_eq!(result.rule_type, RuleType::GeoIp);
 
@@ -2619,7 +2828,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2640,7 +2851,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "SuffixProxy");
 
         let miss = Metadata {
@@ -2648,7 +2861,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2681,7 +2896,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&hit, &rules).expect("must match");
+        let result = set
+            .match_rules(&hit, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "LogicProxy");
         assert_eq!(result.rule_type, RuleType::And);
 
@@ -2691,7 +2908,9 @@ mod tests {
             dst_port: 80,
             ..Default::default()
         };
-        let result = set.match_rules(&miss, &rules).expect("must match");
+        let result = set
+            .match_rules(&miss, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2728,7 +2947,9 @@ mod tests {
             ..Default::default()
         };
         // The counting child always matches → OR matches via fallback.
-        let result = set.match_rules(&meta, &rules).expect("must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("must match");
         assert_eq!(result.adapter_name, "MixedProxy");
     }
 
@@ -2754,16 +2975,20 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("FINAL must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
         assert_eq!(result.rule_type, RuleType::Match);
     }
 
     #[test]
     fn duplicate_lowered_rules_are_eliminated() {
+        // Same predicate + same adapter: the twin can never change the
+        // outcome — live together, skipped together — so it dedups.
         let rules: Vec<Box<dyn Rule>> = vec![
             Box::new(DomainRule::new("dup.example.com", "First")),
-            Box::new(DomainRule::new("DUP.EXAMPLE.COM", "Second")),
+            Box::new(DomainRule::new("DUP.EXAMPLE.COM", "First")),
             Box::new(FinalRule::new("DIRECT")),
         ];
 
@@ -2776,8 +3001,99 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("domain must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("domain must match");
         assert_eq!(result.adapter_name, "First", "first occurrence wins");
+    }
+
+    /// The continue-semantics converse: an identical predicate targeting a
+    /// DIFFERENT adapter must stay live — a dead first target falls through
+    /// to the twin (issue #513).
+    #[test]
+    fn duplicate_predicates_with_different_adapters_stay_live() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainRule::new("dup.example.com", "GHOST")),
+            Box::new(DomainRule::new("dup.example.com", "Second")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.len(), 3, "different-adapter twin must be kept");
+
+        let meta = Metadata {
+            host: "dup.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let present = |name: &str| name != "GHOST";
+        let result = set
+            .match_rules(&meta, &rules, &present)
+            .expect("twin must match after the ghost is skipped");
+        assert_eq!(result.adapter_name, "Second");
+    }
+
+    /// A MATCH whose target is not registry-guaranteed must NOT truncate the
+    /// tail at build time: skipped at match time, the next rule wins
+    /// (issue #513 — upstream `continue` semantics).
+    #[test]
+    fn match_with_unguaranteed_target_does_not_truncate_tail() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(FinalRule::new("GHOST")),
+            Box::new(FinalRule::new("REJECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(
+            set.slots().len(),
+            2,
+            "MATCH,ghost must not eliminate the tail",
+        );
+
+        let meta = Metadata::default();
+        let result = set
+            .match_rules(&meta, &rules, &|name| name != "GHOST")
+            .expect("second MATCH must win after the ghost is skipped");
+        assert_eq!(result.adapter_name, "REJECT");
+
+        // With the ghost present, first match wins as usual.
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("first MATCH wins when live");
+        assert_eq!(result.adapter_name, "GHOST");
+    }
+
+    /// Indexed-plan tail scans must evaluate a SECOND matching domain rule
+    /// after a skipped hit — its slot is trie-owned, so a plain slot scan
+    /// would skip it and leak the host to DIRECT (issue #513).
+    #[test]
+    fn skipped_trie_hit_falls_through_to_second_domain_rule() {
+        let mut rules = filler_suffix_rules(70);
+        let ghost_idx = rules.len();
+        rules.push(Box::new(DomainRule::new("ads.example", "GHOST")));
+        rules.push(Box::new(DomainSuffixRule::new("example", "REJECT")));
+        rules.push(Box::new(FinalRule::new("DIRECT")));
+
+        let set = CompiledRuleSet::build(&rules);
+        assert!(!set.uses_linear_scan_plan(), "must run the indexed plan");
+
+        let meta = Metadata {
+            host: "ads.example".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let present = |name: &str| name != "GHOST";
+        let result = set
+            .match_rules(&meta, &rules, &present)
+            .expect("suffix rule must win after the ghost hit is skipped");
+        assert_eq!(result.adapter_name, "REJECT");
+        assert_eq!(result.rule_index, ghost_idx + 1);
+
+        // Lazy path agrees.
+        match set.match_rules_lazy(&meta, &rules, &present) {
+            LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "REJECT"),
+            LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
+                panic!("lazy path diverged")
+            }
+        }
     }
 
     #[test]
@@ -2800,7 +3116,9 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let result = set.match_rules(&meta, &rules).expect("FINAL must match");
+        let result = set
+            .match_rules(&meta, &rules, &|_| true)
+            .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
 
@@ -2818,7 +3136,7 @@ mod tests {
 
         assert_eq!(set.len(), 1, "UID op is constant-false off Linux");
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("FINAL must match");
         assert_eq!(result.adapter_name, "DIRECT");
     }
@@ -2874,7 +3192,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("domain rule must match");
         assert_eq!(result.adapter_name, "Proxy");
         assert_eq!(result.rule_type, RuleType::DomainSuffix);
@@ -2898,7 +3216,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("earlier port rule must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::DstPort);
@@ -2919,7 +3237,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("port list must match");
         assert_eq!(result.adapter_name, "PortProxy");
         assert_eq!(result.rule_type, RuleType::DstPort);
@@ -2940,7 +3258,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("in-port list must match");
         assert_eq!(result.adapter_name, "InboundProxy");
         assert_eq!(result.rule_type, RuleType::InPort);
@@ -2967,7 +3285,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("geosite attr fallback must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::GeoSite);
@@ -2995,7 +3313,7 @@ mod tests {
             ..Default::default()
         };
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("geoip fallback must match");
         assert_eq!(result.adapter_name, "GeoProxy");
         assert_eq!(result.rule_type, RuleType::GeoIp);
@@ -3022,7 +3340,7 @@ mod tests {
             ..Default::default()
         };
         let result = compiled
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("rule-set op must match");
         assert_eq!(result.adapter_name, "Direct");
         assert_eq!(result.rule_type, RuleType::RuleSet);
@@ -3044,7 +3362,7 @@ mod tests {
         };
 
         let result = set
-            .match_rules(&meta, &rules)
+            .match_rules(&meta, &rules, &|_| true)
             .expect("domain rule must match");
         assert_eq!(result.adapter_name, "Broad");
         assert_eq!(result.rule_type, RuleType::DomainSuffix);
@@ -3067,7 +3385,7 @@ mod tests {
         counts.reset();
 
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("counting rule must match");
 
         assert_eq!(result.adapter_name, "DIRECT");
@@ -3085,7 +3403,7 @@ mod tests {
 
         let set = CompiledRuleSet::build(&rules);
         let result = set
-            .match_rules(&Metadata::default(), &rules)
+            .match_rules(&Metadata::default(), &rules, &|_| true)
             .expect("sub-rule inner final must match");
 
         assert_eq!(result.adapter_name, "InnerProxy");
@@ -3109,10 +3427,10 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={host}");
@@ -3140,10 +3458,10 @@ mod tests {
                 dst_port: 443,
                 ..Default::default()
             };
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={host}");
@@ -3204,13 +3522,71 @@ mod tests {
         ];
 
         for metadata in cases {
-            let legacy = match_engine::match_rules(&metadata, &rules, &index)
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
             let compiled = compiled
-                .match_rules(&metadata, &rules)
+                .match_rules(&metadata, &rules, &|_| true)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
 
             assert_eq!(compiled, legacy, "metadata host={}", metadata.host);
+        }
+    }
+
+    /// Both engines must agree under continue-on-missing-target semantics —
+    /// the `|_| true` run above cannot exercise the skip path (issue #513).
+    /// Covers dedup twins, shadowed pairs, covered CIDRs, a dead MATCH
+    /// terminator, and a second domain hit after a skipped one.
+    #[test]
+    fn compiled_rules_match_legacy_engine_under_missing_targets() {
+        let mut rules = filler_suffix_rules(70); // force the indexed plan
+        rules.extend([
+            Box::new(DomainRule::new("ads.example", "GHOST")) as Box<dyn Rule>,
+            Box::new(DomainSuffixRule::new("example", "REJECT")),
+            Box::new(DomainRule::new("dup.example.com", "GHOST")),
+            Box::new(DomainRule::new("dup.example.com", "Twin")),
+            Box::new(IpCidrRule::new("10.0.0.0/8", "GHOST", false, true).unwrap()),
+            Box::new(IpCidrRule::new("10.1.0.0/16", "CidrTwin", false, true).unwrap()),
+            Box::new(FinalRule::new("GHOST")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        let index = LegacyDomainIndex::build(&rules);
+        let compiled = CompiledRuleSet::build(&rules);
+        assert!(
+            !compiled.uses_linear_scan_plan(),
+            "fixture must exercise the indexed plan"
+        );
+        let present = |name: &str| name != "GHOST";
+
+        for metadata in [
+            Metadata {
+                host: "ads.example".into(),
+                ..Default::default()
+            },
+            Metadata {
+                host: "dup.example.com".into(),
+                ..Default::default()
+            },
+            Metadata {
+                dst_ip: Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+                ..Default::default()
+            },
+            Metadata {
+                host: "s0.example".into(),
+                ..Default::default()
+            },
+            Metadata::default(),
+        ] {
+            let legacy = match_engine::match_rules(&metadata, &rules, &index, &present)
+                .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
+            let strict = compiled
+                .match_rules(&metadata, &rules, &present)
+                .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
+            let lazy = match compiled.match_rules_lazy(&metadata, &rules, &present) {
+                LazyMatchOutcome::Matched(m) => Some((m.adapter_name, m.rule_type, m.rule_payload)),
+                LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => None,
+            };
+            assert_eq!(strict, legacy, "metadata host={}", metadata.host);
+            assert_eq!(lazy, legacy, "lazy, host={}", metadata.host);
         }
     }
 
