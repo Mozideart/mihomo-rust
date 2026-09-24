@@ -85,6 +85,12 @@ pub struct AppState {
     /// commit that swaps `rule_providers` so providers added, removed, or
     /// re-`interval`ed by a reload gain/lose their task (issue #543).
     pub rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
+    /// Owns the per-provider `interval` refresh tasks for
+    /// `proxy_providers` — reconciled by [`commit_proxy_providers`] on
+    /// every commit so added/removed/re-`interval`ed providers gain/lose
+    /// their task (issue #625).
+    pub proxy_provider_refresh:
+        Arc<meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor>,
     /// Snapshot of active named listeners (read-only, startup-time only in M1).
     pub listeners: Vec<NamedListener>,
     /// Validated directory for a third-party web UI. When `Some`, it is served
@@ -1171,6 +1177,8 @@ async fn apply_raw_to_tunnel(
         &state.proxy_providers,
         &proxy_providers,
         raw.strict.unwrap_or(false),
+        raw.proxy_providers.as_ref(),
+        &state.proxy_provider_refresh,
     );
     Ok((dns, prior_resolver))
 }
@@ -1208,10 +1216,20 @@ async fn commit_raw_candidate(
 /// Callers must hold the `CONFIG_MUTATION` lane (issue #543) — the
 /// insert/prune ordering below is only meaningful when no sibling commit
 /// can interleave a registry swap.
+///
+/// `raws` is the *candidate's* `proxy-providers:` declarations (the same
+/// map `candidate` was materialized from) and `refresh` the shared
+/// supervisor: after the registry swap, `reconcile` diffs them so
+/// providers added, removed, or re-`interval`ed by this commit gain/lose
+/// their background refresh task without a restart (issue #625). Pass
+/// `None` for `raws` only when the candidate carried no
+/// `proxy-providers:` section.
 pub fn commit_proxy_providers(
-    registry: &DashMap<String, Arc<ProxyProvider>>,
+    registry: &Arc<DashMap<String, Arc<ProxyProvider>>>,
     candidate: &std::collections::HashMap<String, Arc<ProxyProvider>>,
     strict: bool,
+    raws: Option<&std::collections::HashMap<String, meow_config::raw::RawProxyProvider>>,
+    refresh: &meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor,
 ) {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
@@ -1234,14 +1252,23 @@ pub fn commit_proxy_providers(
         if needs_fetch {
             let provider = Arc::clone(provider);
             let name = name.clone();
+            // `acquire_initial`, not `refresh`: a freshly committed
+            // provider has an empty slot, so the on-disk cache fallback
+            // (offline bootstrap) applies — refresh ticks deliberately
+            // skip it to keep the in-memory last-good set.
             tokio::spawn(async move {
-                if let Err(e) = provider.refresh().await {
+                if let Err(e) = provider.acquire_initial().await {
                     tracing::warn!("proxy-provider '{name}': initial fetch failed: {e}");
                 }
             });
         }
     }
     registry.retain(|name, _| candidate.contains_key(name));
+    // Publish first, then supervise — the interval refresh loops follow
+    // the committed declarations: a provider added or re-`interval`ed by
+    // this commit gains/respawns its task, a removed one loses it
+    // (issue #625).
+    refresh.reconcile(registry, raws);
 }
 
 /// `true` when the `dns:` section references runtime objects outside
@@ -2781,6 +2808,8 @@ async fn put_configs(
         &state.proxy_providers,
         &proxy_providers,
         raw_config.strict.unwrap_or(false),
+        raw_config.proxy_providers.as_ref(),
+        &state.proxy_provider_refresh,
     );
 
     swap_config_and_reconcile_tun(&state, raw_config, dns, prior_resolver).await;
@@ -3605,10 +3634,12 @@ mod tests {
                 ProxyProvider::new(name, &def, None, false, false, Default::default()).unwrap(),
             )
         };
-        let registry: DashMap<String, Arc<ProxyProvider>> = DashMap::new();
+        let registry: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
         let keep = mk("keep");
         registry.insert("keep".to_string(), Arc::clone(&keep));
         registry.insert("gone".to_string(), mk("gone"));
+        let refresh =
+            meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default();
 
         // `commit_proxy_providers` asserts the caller holds the lane.
         let _lane = CONFIG_MUTATION.lock().await;
@@ -3617,14 +3648,88 @@ mod tests {
             ("keep".to_string(), Arc::clone(&keep)), // reused Arc
             ("fresh".to_string(), mk("fresh")),
         ]);
-        commit_proxy_providers(&registry, &candidate, true);
+        commit_proxy_providers(&registry, &candidate, true, None, &refresh);
 
         assert!(Arc::ptr_eq(registry.get("keep").unwrap().value(), &keep));
         assert!(registry.contains_key("fresh"));
         assert!(!registry.contains_key("gone"), "removed decls are pruned");
 
         // A candidate with no providers at all clears the registry.
-        commit_proxy_providers(&registry, &HashMap::new(), false);
+        commit_proxy_providers(&registry, &HashMap::new(), false, None, &refresh);
         assert!(registry.is_empty());
+    }
+
+    /// Issue #625: the commit must wire the interval supervisor end to end —
+    /// a committed `file` provider with `interval: 1` must tick-refresh its
+    /// slot without any manual PUT. Driven on a real file + real clock so a
+    /// missing `reconcile` call fails the assertion outright.
+    ///
+    /// The provider is pre-seeded into the registry so the commit's
+    /// `needs_fetch` is false — otherwise the detached initial fetch (which
+    /// polls on the test's first `.await`, after the file is rewritten)
+    /// satisfies the assertion even with `reconcile` stubbed out.
+    #[tokio::test]
+    async fn commit_proxy_providers_reconciles_interval_tasks() {
+        use meow_config::proxy_provider::ProxyProvider;
+        use meow_config::raw::RawProxyProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.yaml");
+        std::fs::write(&path, "proxies: []\n").unwrap();
+        let raw = RawProxyProvider {
+            provider_type: "file".to_string(),
+            url: None,
+            path: Some("p.yaml".to_string()),
+            interval: Some(1),
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            allow_external_plugin: None,
+            header: None,
+            override_: None,
+            proxy: None,
+            dialer_proxy: None,
+        };
+        let provider = Arc::new(
+            ProxyProvider::new(
+                "p",
+                &raw,
+                Some(dir.path()),
+                false,
+                false,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(provider.proxies().len(), 0);
+
+        let registry: Arc<DashMap<String, Arc<ProxyProvider>>> = Arc::new(DashMap::new());
+        // Pre-seed: same Arc ⇒ `needs_fetch` false ⇒ no detached initial
+        // fetch — the interval task is the only refresher in this test.
+        registry.insert("p".to_string(), Arc::clone(&provider));
+        let refresh =
+            meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor::default();
+        let _lane = CONFIG_MUTATION.lock().await;
+        let candidate: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("p".to_string(), Arc::clone(&provider))]);
+        let raws: HashMap<String, RawProxyProvider> = HashMap::from([("p".to_string(), raw)]);
+        commit_proxy_providers(&registry, &candidate, false, Some(&raws), &refresh);
+        drop(_lane);
+
+        // Write a node; the next tick must pick it up with no manual
+        // refresh. Generous bound for loaded CI machines.
+        std::fs::write(&path, "proxies:\n  - {name: a, type: direct}\n").unwrap();
+        for _ in 0..50 {
+            if provider.proxies().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            provider.proxies().len(),
+            1,
+            "the committed interval task must refresh the provider"
+        );
     }
 }
