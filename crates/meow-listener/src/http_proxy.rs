@@ -4,7 +4,6 @@ use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
 use meow_tunnel::{
     copy_bidirectional_buf_tracked, route_inbound_tcp, ResolvedTarget, Tunnel, RELAY_BUF_SIZE,
 };
-use smallvec::smallvec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -272,12 +271,8 @@ async fn handle_http_inner(
         } = target;
         let mut route = Some(route);
 
-        let Some(_guard) = admission.track(
-            metadata.pure(),
-            rule_name,
-            rule_payload,
-            smallvec![Arc::from(proxy.name())],
-        ) else {
+        let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+        else {
             return Ok(());
         };
 

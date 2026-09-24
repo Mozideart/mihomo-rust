@@ -206,6 +206,14 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- **TCP tracking without an external controller (#626).** Store only
+  cancellation handles when `external-controller` is absent at startup,
+  while preserving full API tracking by default for embedders. Headless
+  registry keys follow the handle lifetime rather than a cumulative
+  counter, avoiding exhaustion on 32-bit targets. `ConnectionGuard::id()`
+  now returns `Option<Uuid>`: `Some(id)` for API-tracked connections and
+  `None` for headless connections.
+
 - **`AppState::config_mutation_lock` was removed** — the per-state mutex
   serialised only `swap_config_and_reconcile_tun`, whose every caller
   already holds the process-global `CONFIG_MUTATION` lane. The nested

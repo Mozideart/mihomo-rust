@@ -6,7 +6,6 @@ use crate::sniffer::SnifferRuntime;
 use firewall::FirewallGuard;
 use meow_common::{with_dial_timeout, ConnType, Metadata, Network};
 use meow_tunnel::{copy_bidirectional_buf_tracked, ResolvedTarget, Tunnel, RELAY_BUF_SIZE};
-use smallvec::smallvec;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -492,12 +491,8 @@ async fn handle_tproxy_conn(
         proxy.name()
     );
 
-    let Some(_guard) = admission.track(
-        metadata.pure(),
-        rule_name,
-        rule_payload,
-        smallvec![Arc::from(proxy.name())],
-    ) else {
+    let Some(_guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.name())
+    else {
         return Ok(());
     };
 

@@ -806,6 +806,11 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    if config.api.external_controller.is_none() {
+        // No API can inspect individual connections. Keep cancellation handles
+        // for cold reloads without storing their display metadata.
+        tunnel.statistics().set_headless();
+    }
     // Provider-sourced nodes resolve `dialer-proxy` names against this
     // registry; install before the first `update_routing` so it publishes
     // the initial route map (issue #489).
