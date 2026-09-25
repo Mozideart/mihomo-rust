@@ -347,8 +347,8 @@ impl DnsServer {
     }
 
     /// Forward a non-A/AAAA query through the resolver pipeline and emit the
-    /// returned records as a wire-format response. On upstream failure we
-    /// return SERVFAIL (not NXDOMAIN) — clients may negative-cache NXDOMAIN
+    /// returned records and response code as a wire-format response. Without an
+    /// upstream response, return SERVFAIL — clients may negative-cache NXDOMAIN
     /// against the bare name, which would poison subsequent A/AAAA lookups.
     async fn handle_generic_forward(
         id: u16,
@@ -377,7 +377,7 @@ impl DnsServer {
 
         match lookup {
             Some(l) => {
-                resp.metadata.response_code = ResponseCode::NoError;
+                resp.metadata.response_code = l.metadata.response_code;
                 // In fake-IP mode, drop ipv4hint/ipv6hint from HTTPS/SVCB
                 // answers for faked hosts so an HTTP/3 client cannot read a
                 // real origin IP out of the hint and bypass the fake-IP
@@ -1216,6 +1216,13 @@ mod tests {
     }
 
     async fn resolver_with_upstream_rcode(code: ResponseCode) -> crate::resolver::Resolver {
+        resolver_with_upstream_response(code, None).await
+    }
+
+    async fn resolver_with_upstream_response(
+        code: ResponseCode,
+        answer: Option<Record>,
+    ) -> crate::resolver::Resolver {
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1226,6 +1233,9 @@ mod tests {
                 Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
             response.metadata.response_code = code;
             response.add_queries(request.queries.iter().cloned());
+            if let Some(answer) = answer {
+                response.add_answer(answer);
+            }
             upstream
                 .send_to(&response.to_bytes().unwrap(), peer)
                 .await
@@ -1307,6 +1317,63 @@ mod tests {
             assert_eq!(response[3] & 0x0f, expected.low());
             assert_eq!(&response[6..8], &[0, 0]);
         }
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_preserves_upstream_response_code() {
+        for qtype in [RecordType::TXT, RecordType::MX, RecordType::HTTPS] {
+            for code in [
+                ResponseCode::NoError,
+                ResponseCode::NXDomain,
+                ResponseCode::ServFail,
+                ResponseCode::Refused,
+            ] {
+                let resolver = resolver_with_upstream_rcode(code).await;
+                let query = sample_query(7, u16::from(qtype));
+                let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+                let response = Message::from_vec(&response).unwrap();
+                assert_eq!(
+                    response.metadata.response_code, code,
+                    "query type {qtype}, upstream response {code}"
+                );
+                assert_eq!(response.metadata.id, 7);
+                assert_eq!(response.queries, Message::from_vec(&query).unwrap().queries);
+                assert!(response.answers.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_preserves_txt_answer() {
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{Name, RData};
+
+        let answer = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            123,
+            RData::TXT(TXT::new(vec!["forwarded TXT answer".to_string()])),
+        );
+        let resolver =
+            resolver_with_upstream_response(ResponseCode::NoError, Some(answer.clone())).await;
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &resolver).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0], answer);
+        // Record equality ignores TTL.
+        assert_eq!(response.answers[0].ttl, answer.ttl);
+    }
+
+    #[tokio::test]
+    async fn handle_query_generic_without_upstream_returns_servfail() {
+        let query = sample_query(7, u16::from(RecordType::TXT));
+        let response = DnsServer::handle_query(&query, &empty_resolver())
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[test]
