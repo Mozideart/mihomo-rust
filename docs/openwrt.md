@@ -91,9 +91,12 @@ crashes.
 meow REST API through authenticated LuCI RPC (including on HTTPS pages), and proxy management is the built-in web panel, so LuCI does
 not reimplement a dashboard:
 
-- **Overview**: service state, REST API reachability and version,
-  transparent-proxy state, mode switch (`PATCH /configs`), traffic totals and
-  rates, and active connections (`/connections`).
+- **Overview**: service state and version, transparent-proxy state, proxy
+  mode switch (`PATCH /configs`) with a one-line explanation of each mode,
+  current speed, traffic totals and active connections (`/connections`).
+  Start/Stop/Restart buttons match the service state and report failures.
+  When meow is disabled a banner offers **Enable and start**; when it is
+  enabled but stopped, the banner points to the Log.
 - **Panel**: meow's built-in web dashboard (`http://<router>:<panel_port>/ui`)
   embedded in LuCI, covering proxy selection, subscriptions, groups and
   rules. The API secret is passed in the URL fragment (`#token=`), so the
@@ -104,11 +107,19 @@ not reimplement a dashboard:
   Validation uses cached rule providers and local geodata without downloading;
   missing databases are deferred to normal startup, so first-time setups can
   still validate. Existing local databases are checked normally.
-- **Clients**: ARP-based client steering — pick which LAN devices are routed
-  through the side router (see below).
-- **Settings**: service options (enable, config path, working directory,
-  panel port, API secret) and the transparent-proxy section.
-- **Log**: meow's entries from the system log.
+  A status line shows lines, size and unsaved changes; **Revert** restores
+  the saved file, Tab indents with two spaces, Ctrl/Cmd+S saves, and leaving
+  the page with unsaved edits asks first.
+- **Clients**: known LAN clients (hostname, IP, MAC) with a per-client proxy
+  bypass, plus opt-in ARP-based client steering (see below).
+- **Settings**: Basic/Advanced tabs for the service (enable, panel port,
+  panel password; config path and working directory under Advanced) and the
+  transparent proxy (on/off with live status, TCP+UDP or TCP only, LAN
+  interface, DNS handling; ports, IPv6 and bypass networks under Advanced).
+  "Proxy IPv6" is offered only in TCP-only mode, the one mode that supports it.
+- **Log**: meow's entries from the system log, oldest first and following the
+  newest entry; text filter, level filter (all / warnings and errors / errors),
+  errors in red and warnings in orange, Pause/Resume, and Download.
 
 `panel_port` and `secret` are authoritative: the init script passes them to
 meow as `--ext-ctl 0.0.0.0:<panel_port>` and `--secret <secret>`, overriding
@@ -186,10 +197,29 @@ address by one of:
   reservation/option on the main router (cleanest — no spoofing); or
 - **ARP client steering** (below), which needs no client or main-router change.
 
-## Selecting clients by ARP (Clients tab)
+## Clients tab: bypass and ARP steering
 
-**Services → meow → Clients** lists the LAN neighbour table with a checkbox per
-device. For each ticked client, the `meow-arp` service (`arp-hijack.sh`)
+**Services → meow → Clients** lists the LAN clients this router knows about —
+DHCP leases, static leases (`/etc/config/dhcp` hosts) and neighbours — with
+their hostname, IPv4/IPv6 addresses, MAC and source.
+
+### Bypassing the proxy per client
+
+Tick **Bypass** for a client and Save & Apply: its traffic is no longer
+captured by the transparent proxy **and** its DNS is no longer hijacked to
+meow (so fake-ip answers never reach it). Clients are matched by MAC, so a new
+DHCP lease keeps the setting. The list is stored as
+`list bypass_mac '<MAC>'` in the `tproxy` section of `/etc/config/meow`;
+`gateway.sh` loads it into the nftables set `inet meow_gateway bypass_src`,
+checked first in both capture chains. CLI equivalent:
+`uci add_list meow.tproxy.bypass_mac=<MAC>`, `uci commit meow`,
+`/etc/init.d/meow restart`.
+
+### Selecting clients by ARP (advanced, opt-in)
+
+Steering lives in the collapsed **ARP client steering (advanced)** section;
+enabling it reveals a **Steer** column (a client is either bypassed or
+steered, never both). For each ticked client, the `meow-arp` service (`arp-hijack.sh`)
 periodically sends it a unicast ARP reply announcing this router as the
 client's gateway, so the client's off-LAN traffic arrives here and is
 transparently proxied — without touching the client or the main router's DHCP.
