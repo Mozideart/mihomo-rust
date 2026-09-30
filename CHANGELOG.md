@@ -437,6 +437,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **XTLS Vision over plain TLS works with TLS 1.3 destinations**
+  (#495 item 5). Only the REALITY stream could switch to the raw socket
+  for Vision's DIRECT mode, so with `tls: true` (no REALITY) every
+  connection to a TLS 1.3 site (most of HTTPS) failed on its first app
+  data. The BoringSSL TLS stream now switches too, draining any plaintext
+  it already decrypted first; a transport that cannot switch now sends
+  END instead of DIRECT. `flow: xtls-rprx-vision` with a
+  `ws`/`grpc`/`h2`/`httpupgrade`/`xhttp` network is now a config error
+  (Xray rejects it too; it used to load, then fail on TLS 1.3 sites), unless VLESS
+  `encryption` is set. Docker e2e runs a TLS 1.3 session with 1 MiB each
+  way through Vision + TLS against Xray-core.
+
 - **Relay groups no longer send UDP out of the first hop.** A relay's UDP
   went through hop 0 whenever every member supported UDP, so
   `relay: [DIRECT, ss-b]` sent UDP straight from the host while its TCP
